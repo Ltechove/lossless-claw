@@ -1397,13 +1397,16 @@ describe("LcmContextEngine.ingest content extraction", () => {
         role: string;
         toolCallId?: string;
         toolName?: string;
-        content?: Array<{ output?: unknown }>;
+        content?: Array<{ type?: unknown; text?: unknown; output?: unknown }>;
       };
       expect(assembledToolResult.role).toBe("toolResult");
       expect(assembledToolResult.toolCallId).toBe("call_live_exec");
       expect(assembledToolResult.toolName).toBe("exec");
-      expect(typeof assembledToolResult.content?.[0]?.output).toBe("string");
-      expect(String(assembledToolResult.content?.[0]?.output)).toContain(fileId);
+      const block = assembledToolResult.content?.[0];
+      expect(block?.type).toBe("text");
+      expect(typeof block?.text).toBe("string");
+      expect(String(block?.text)).toContain(fileId);
+      expect(block).not.toHaveProperty("output");
     });
   });
 
