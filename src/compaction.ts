@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ConversationStore, CreateMessagePartInput } from "./store/conversation-store.js";
 import type { SummaryStore, SummaryRecord, ContextItemRecord } from "./store/summary-store.js";
+import { estimateTokens, truncateTextToEstimatedTokens } from "./estimate-tokens.js";
 import { extractFileIdsFromContent } from "./large-files.js";
 import { NOOP_LCM_LOGGER, type LcmLogger } from "./lcm-log.js";
 import { LcmProviderAuthError } from "./summarize.js";
@@ -93,10 +94,6 @@ type CondensedPhaseCandidate = {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/** Estimate token count from character length (~4 chars per token). */
-function estimateTokens(content: string): number {
-  return Math.ceil(content.length / 4);
-}
 
 /** Deterministically cap summary text so the persisted output stays within maxTokens. */
 function capSummaryText(
@@ -112,14 +109,14 @@ function capSummaryText(
   ];
 
   for (const suffix of suffixes) {
-    const maxChars = Math.max(0, maxTokens * 4 - suffix.length);
-    const capped = `${content.slice(0, maxChars)}${suffix}`;
+    const contentBudget = Math.max(0, maxTokens - estimateTokens(suffix));
+    const capped = `${truncateTextToEstimatedTokens(content, contentBudget)}${suffix}`;
     if (estimateTokens(capped) <= maxTokens) {
       return capped;
     }
   }
 
-  return content.slice(0, Math.max(0, maxTokens * 4));
+  return truncateTextToEstimatedTokens(content, maxTokens);
 }
 
 /** Format a timestamp as `YYYY-MM-DD HH:mm TZ` for prompt source text. */
@@ -176,8 +173,8 @@ function generateSummaryId(content: string): string {
   );
 }
 
-/** Maximum characters for the deterministic fallback truncation (512 tokens * 4 chars). */
-const FALLBACK_MAX_CHARS = 512 * 4;
+/** Maximum estimated tokens for the deterministic fallback truncation. */
+const FALLBACK_MAX_TOKENS = 512;
 const DEFAULT_LEAF_CHUNK_TOKENS = 20_000;
 
 /**
@@ -1301,13 +1298,13 @@ export class CompactionEngine {
     }
     const inputTokens = Math.max(1, estimateTokens(sourceText));
     const buildDeterministicFallback = (): { content: string; level: CompactionLevel } => {
-      const truncated =
-        sourceText.length > FALLBACK_MAX_CHARS
-          ? sourceText.slice(0, FALLBACK_MAX_CHARS)
-          : sourceText;
+      const suffix = `\n[Truncated from ${inputTokens} tokens]`;
+      const truncated = truncateTextToEstimatedTokens(
+        sourceText,
+        Math.max(0, FALLBACK_MAX_TOKENS - estimateTokens(suffix)),
+      );
       return {
-        content: `${truncated}
-[Truncated from ${inputTokens} tokens]`,
+        content: `${truncated}${suffix}`,
         level: "fallback",
       };
     };
