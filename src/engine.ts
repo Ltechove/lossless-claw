@@ -2151,6 +2151,341 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  // ── Image detection & externalization ──────────────────────────────────────
+
+  private static readonly BASE64_IMAGE_MAGIC: ReadonlyArray<{
+    prefix: string;
+    extension: string;
+    mimeType: string;
+  }> = [
+    { prefix: "/9j/", extension: "jpg", mimeType: "image/jpeg" },
+    { prefix: "iVBOR", extension: "png", mimeType: "image/png" },
+    { prefix: "R0lGOD", extension: "gif", mimeType: "image/gif" },
+    { prefix: "UklGR", extension: "webp", mimeType: "image/webp" },
+    { prefix: "PHN2Zy", extension: "svg", mimeType: "image/svg+xml" },
+  ];
+
+  private static detectBase64ImageType(
+    base64Data: string,
+  ): { extension: string; mimeType: string } | null {
+    for (const sig of LcmContextEngine.BASE64_IMAGE_MAGIC) {
+      if (base64Data.startsWith(sig.prefix)) {
+        return { extension: sig.extension, mimeType: sig.mimeType };
+      }
+    }
+    return null;
+  }
+
+  private static isExternalizedImageReference(value: string): boolean {
+    return /^\[(?:User|Tool|Assistant|Image) image: .*LCM file: file_[a-f0-9]{16}\]$/.test(
+      value.trim(),
+    );
+  }
+
+  /** Resolve the configured externalized-payload directory for one conversation. */
+  private largeFilesDirForConversation(conversationId: number): string {
+    return join(this.config.largeFilesDir, String(conversationId));
+  }
+
+  private async storeImageFileContent(params: {
+    conversationId: number;
+    fileId: string;
+    extension: string;
+    base64Data: string;
+  }): Promise<string> {
+    const dir = this.largeFilesDirForConversation(params.conversationId);
+    await mkdir(dir, { recursive: true });
+    const normalized = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin";
+    const filePath = join(dir, `${params.fileId}.${normalized}`);
+    const buffer = Buffer.from(params.base64Data, "base64");
+    await writeFile(filePath, buffer);
+    return filePath;
+  }
+
+  private async externalizeImage(params: {
+    conversationId: number;
+    base64Data: string;
+    fileName?: string;
+    extension: string;
+    mimeType: string;
+    label: string;
+  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
+    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    const byteSize = Buffer.from(params.base64Data, "base64").byteLength;
+    const storageUri = await this.storeImageFileContent({
+      conversationId: params.conversationId,
+      fileId,
+      extension: params.extension,
+      base64Data: params.base64Data,
+    });
+    const fileName = params.fileName ?? `image.${params.extension}`;
+    const summary = `Image file (${params.extension.toUpperCase()}, ${byteSize.toLocaleString("en-US")} bytes)${params.fileName ? ` — ${params.fileName}` : ""}`;
+
+    await this.summaryStore.insertLargeFile({
+      fileId,
+      conversationId: params.conversationId,
+      fileName,
+      mimeType: params.mimeType,
+      byteSize,
+      storageUri,
+      explorationSummary: summary,
+    });
+
+    const reference = `[${params.label}: ${fileName} (${params.mimeType}, ${byteSize.toLocaleString("en-US")} bytes) | LCM file: ${fileId}]`;
+    return { fileId, byteSize, summary, reference };
+  }
+
+  private async interceptInlineImages(params: {
+    conversationId: number;
+    content: string;
+    role: string;
+  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
+    const mediaResult = await this.interceptUserMediaBase64(params);
+    if (mediaResult) {
+      return mediaResult;
+    }
+    return this.interceptPureBase64Image(params);
+  }
+
+  private async interceptUserMediaBase64(params: {
+    conversationId: number;
+    content: string;
+  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
+    const prefix = "[media attached:";
+    if (!params.content.startsWith(prefix)) {
+      return null;
+    }
+
+    const base64LineRe = /\n([A-Za-z0-9+/]{20,}={0,2})\n/m;
+    const base64Match = base64LineRe.exec(params.content);
+    if (!base64Match) {
+      return null;
+    }
+
+    const headerEnd = base64Match.index + 1;
+    const header = params.content.slice(0, headerEnd).trim();
+    const base64Data = params.content.slice(headerEnd);
+
+    if (estimateTokens(base64Data) < 100) {
+      return null;
+    }
+
+    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
+    if (!detected) {
+      return null;
+    }
+
+    const pathMatch = header.match(/\[media attached:\s*([^\s(]+)/);
+    const fileName = pathMatch ? pathMatch[1] : `user-image.${detected.extension}`;
+
+    const externalized = await this.externalizeImage({
+      conversationId: params.conversationId,
+      base64Data,
+      fileName,
+      extension: detected.extension,
+      mimeType: detected.mimeType,
+      label: "User image",
+    });
+
+    return {
+      rewrittenContent: `${header}\n\n${externalized.reference}`,
+      fileIds: [externalized.fileId],
+    };
+  }
+
+  private async interceptPureBase64Image(params: {
+    conversationId: number;
+    content: string;
+    role: string;
+  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
+    const trimmed = params.content.trim();
+    if (estimateTokens(trimmed) < 100) {
+      return null;
+    }
+
+    const detected = LcmContextEngine.detectBase64ImageType(trimmed);
+    if (!detected) {
+      return null;
+    }
+
+    const b64Chars = trimmed.replace(/[^A-Za-z0-9+/=\s]/g, "");
+    if (b64Chars.length / trimmed.length < 0.8) {
+      return null;
+    }
+
+    const label = params.role === "tool" ? "Tool image" :
+                  params.role === "assistant" ? "Assistant image" : "Image";
+    const fileName = `${params.role}-image.${detected.extension}`;
+
+    const externalized = await this.externalizeImage({
+      conversationId: params.conversationId,
+      base64Data: trimmed,
+      fileName,
+      extension: detected.extension,
+      mimeType: detected.mimeType,
+      label,
+    });
+
+    return {
+      rewrittenContent: externalized.reference,
+      fileIds: [externalized.fileId],
+    };
+  }
+
+  /**
+   * Walk tool-result payload blocks and replace pure inline image strings with
+   * compact references before generic text-output externalization runs.
+   */
+  private async rewriteToolInlineImageValue(params: {
+    conversationId: number;
+    value: unknown;
+  }): Promise<{ rewrittenValue: unknown; fileIds: string[]; changed: boolean }> {
+    if (typeof params.value === "string") {
+      const intercepted = await this.interceptPureBase64Image({
+        conversationId: params.conversationId,
+        content: params.value,
+        role: "tool",
+      });
+      if (!intercepted) {
+        return { rewrittenValue: params.value, fileIds: [], changed: false };
+      }
+      return {
+        rewrittenValue: intercepted.rewrittenContent,
+        fileIds: intercepted.fileIds,
+        changed: true,
+      };
+    }
+
+    if (Array.isArray(params.value)) {
+      const rewrittenValues: unknown[] = [];
+      const fileIds: string[] = [];
+      let changed = false;
+
+      for (const entry of params.value) {
+        const rewritten = await this.rewriteToolInlineImageValue({
+          conversationId: params.conversationId,
+          value: entry,
+        });
+        rewrittenValues.push(rewritten.rewrittenValue);
+        fileIds.push(...rewritten.fileIds);
+        changed ||= rewritten.changed;
+      }
+
+      return changed
+        ? { rewrittenValue: rewrittenValues, fileIds, changed: true }
+        : { rewrittenValue: params.value, fileIds: [], changed: false };
+    }
+
+    if (!params.value || typeof params.value !== "object") {
+      return { rewrittenValue: params.value, fileIds: [], changed: false };
+    }
+
+    const record = params.value as Record<string, unknown>;
+    if (record.type === "text" && typeof record.text === "string") {
+      const intercepted = await this.interceptPureBase64Image({
+        conversationId: params.conversationId,
+        content: record.text,
+        role: "tool",
+      });
+      if (!intercepted) {
+        return { rewrittenValue: params.value, fileIds: [], changed: false };
+      }
+      return {
+        rewrittenValue: {
+          ...record,
+          text: intercepted.rewrittenContent,
+        },
+        fileIds: intercepted.fileIds,
+        changed: true,
+      };
+    }
+
+    const nestedKeys = ["output", "content", "result"] as const;
+    const rewrittenRecord: Record<string, unknown> = { ...record };
+    const fileIds: string[] = [];
+    let changed = false;
+
+    for (const key of nestedKeys) {
+      if (!(key in record)) {
+        continue;
+      }
+      const rewritten = await this.rewriteToolInlineImageValue({
+        conversationId: params.conversationId,
+        value: record[key],
+      });
+      if (!rewritten.changed) {
+        continue;
+      }
+      rewrittenRecord[key] = rewritten.rewrittenValue;
+      fileIds.push(...rewritten.fileIds);
+      changed = true;
+    }
+
+    return changed
+      ? { rewrittenValue: rewrittenRecord, fileIds, changed: true }
+      : { rewrittenValue: params.value, fileIds: [], changed: false };
+  }
+
+  private async interceptInlineImagesInToolMessage(params: {
+    conversationId: number;
+    message: AgentMessage;
+  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
+    if (
+      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
+      !("content" in params.message)
+    ) {
+      return null;
+    }
+
+    if (typeof params.message.content === "string") {
+      const intercepted = await this.interceptPureBase64Image({
+        conversationId: params.conversationId,
+        content: params.message.content,
+        role: "tool",
+      });
+      if (!intercepted) {
+        return null;
+      }
+      return {
+        rewrittenMessage: {
+          ...params.message,
+          content: intercepted.rewrittenContent,
+        } as AgentMessage,
+        fileIds: intercepted.fileIds,
+      };
+    }
+
+    if (!Array.isArray(params.message.content)) {
+      return null;
+    }
+
+    const rewrittenContent: unknown[] = [];
+    const fileIds: string[] = [];
+    let changed = false;
+
+    for (const item of params.message.content) {
+      const rewritten = await this.rewriteToolInlineImageValue({
+        conversationId: params.conversationId,
+        value: item,
+      });
+      rewrittenContent.push(rewritten.rewrittenValue);
+      fileIds.push(...rewritten.fileIds);
+      changed ||= rewritten.changed;
+    }
+
+    if (!changed) {
+      return null;
+    }
+
+    return {
+      rewrittenMessage: {
+        ...params.message,
+        content: rewrittenContent,
+      } as AgentMessage,
+      fileIds,
+    };
+  }
+
   /** Persist intercepted large-file text payloads to the configured lcm-files directory. */
   private async storeLargeFileContent(params: {
     conversationId: number;
@@ -2158,7 +2493,7 @@ export class LcmContextEngine implements ContextEngine {
     extension: string;
     content: string;
   }): Promise<string> {
-    const dir = join(this.config.largeFilesDir, String(params.conversationId));
+    const dir = this.largeFilesDirForConversation(params.conversationId);
     await mkdir(dir, { recursive: true });
 
     const normalizedExtension = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "txt";
@@ -2283,6 +2618,18 @@ export class LcmContextEngine implements ContextEngine {
     ) {
       return null;
     }
+
+    // Convert string content to array format for unified processing.
+    if (typeof params.message.content === "string") {
+      params = {
+        ...params,
+        message: {
+          ...params.message,
+          content: [{ type: "text", text: params.message.content }],
+        } as AgentMessage,
+      };
+    }
+
     if (!Array.isArray(params.message.content)) {
       return null;
     }
@@ -2335,6 +2682,13 @@ export class LcmContextEngine implements ContextEngine {
             ? record.content
             : record;
       const extractedText = extractStructuredText(textSource);
+      if (
+        typeof extractedText === "string" &&
+        LcmContextEngine.isExternalizedImageReference(extractedText)
+      ) {
+        rewrittenContent.push(item);
+        continue;
+      }
       if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
         rewrittenContent.push(item);
         continue;
@@ -3210,7 +3564,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const stored = toStoredMessage(message);
+    let stored = toStoredMessage(message);
 
     // Get or create conversation for this session
     const conversation = await this.conversationStore.getOrCreateConversation(sessionId, {
@@ -3219,6 +3573,34 @@ export class LcmContextEngine implements ContextEngine {
     const conversationId = conversation.conversationId;
 
     let messageForParts = message;
+
+    if (stored.role === "tool") {
+      const imageIntercepted = await this.interceptInlineImagesInToolMessage({
+        conversationId,
+        message: messageForParts,
+      });
+      if (imageIntercepted) {
+        messageForParts = imageIntercepted.rewrittenMessage;
+        stored = toStoredMessage(messageForParts);
+      }
+    } else {
+      const imageIntercepted = await this.interceptInlineImages({
+        conversationId,
+        content: stored.content,
+        role: stored.role,
+      });
+      if (imageIntercepted) {
+        stored.content = imageIntercepted.rewrittenContent;
+        stored.tokenCount = estimateTokens(stored.content);
+        if ("content" in message) {
+          messageForParts = {
+            ...message,
+            content: stored.content,
+          } as AgentMessage;
+        }
+      }
+    }
+
     if (stored.role === "user") {
       const intercepted = await this.interceptLargeFiles({
         conversationId,
@@ -3237,7 +3619,7 @@ export class LcmContextEngine implements ContextEngine {
     } else if (stored.role === "tool") {
       const intercepted = await this.interceptLargeToolResults({
         conversationId,
-        message,
+        message: messageForParts,
       });
       if (intercepted) {
         messageForParts = intercepted.rewrittenMessage;
