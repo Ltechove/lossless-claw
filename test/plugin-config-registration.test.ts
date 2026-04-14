@@ -14,7 +14,11 @@ type HookHandler = (event: unknown, context: unknown) => unknown;
 
 function buildApi(
   pluginConfig: unknown,
-  options?: { includeModelAuth?: boolean; agentDir?: string },
+  options?: {
+    includeModelAuth?: boolean;
+    agentDir?: string;
+    runtimeConfig?: Record<string, unknown>;
+  },
 ): {
   api: OpenClawPluginApi;
   getFactory: () => RegisteredEngineFactory;
@@ -58,7 +62,7 @@ function buildApi(
             },
           }),
       config: {
-        loadConfig: vi.fn(() => ({})),
+        loadConfig: vi.fn(() => options?.runtimeConfig ?? {}),
       },
       logging: {
         getChildLogger: vi.fn(() => ({
@@ -517,6 +521,66 @@ describe("lcm plugin registration", () => {
       "[lcm] Compaction summarization model: openai-resp/gpt-5.4 (override)",
     );
     expect(sessionInfoLog).not.toHaveBeenCalled();
+  });
+
+  it("falls back to runtime plugin config for the startup banner when register runs before api.pluginConfig is populated", () => {
+    const { api, infoLog } = buildApi(
+      {},
+      {
+        runtimeConfig: {
+          plugins: {
+            entries: {
+              "lossless-claw": {
+                enabled: true,
+                config: {
+                  summaryModel: "openai-codex/gpt-5.4",
+                },
+              },
+            },
+          },
+        },
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: openai-codex/gpt-5.4 (override)",
+    );
+  });
+
+  it("uses runtime OpenClaw defaults when api.pluginConfig is ready before api.config", () => {
+    const { api, getFactory, infoLog } = buildApi(
+      {
+        enabled: true,
+      },
+      {
+        runtimeConfig: compactionAndDefaultModelConfig({
+          defaultModel: "anthropic/claude-sonnet-4-6",
+        }),
+      },
+    );
+    api.config = {} as OpenClawPluginApi["config"];
+
+    lcmPlugin.register(api);
+
+    expect(infoLog).toHaveBeenCalledWith(
+      "[lcm] Compaction summarization model: anthropic/claude-sonnet-4-6 (default)",
+    );
+
+    const factory = getFactory();
+    expect(factory).toBeTypeOf("function");
+
+    const engine = factory!() as { deps?: { resolveModel: (modelRef?: string, providerHint?: string) => unknown } };
+    const resolved = engine.deps?.resolveModel(undefined, undefined) as
+      | { provider: string; model: string }
+      | undefined;
+
+    expect(resolved).toEqual({
+      provider: "anthropic",
+      model: "claude-sonnet-4-6",
+    });
   });
 
   it("logs the OpenClaw compaction model at startup when no plugin override is set", () => {
