@@ -1737,6 +1737,41 @@ export class LcmContextEngine implements ContextEngine {
     return this.isAnthropicPromptCacheFamily(telemetry) && this.isPromptCacheStillHot(telemetry, now);
   }
 
+  /** Keep deferred Anthropic leaf debt moving once the TTL-safe cache hold has expired. */
+  private shouldForceDeferredAnthropicLeafCompaction(
+    telemetry: ConversationCompactionTelemetryRecord | null,
+    leafDecision: IncrementalCompactionDecision,
+  ): boolean {
+    if (leafDecision.shouldCompact) {
+      return false;
+    }
+    if (
+      leafDecision.reason !== "hot-cache-budget-headroom"
+      && leafDecision.reason !== "hot-cache-defer"
+    ) {
+      return false;
+    }
+    if (!this.isAnthropicPromptCacheFamily(telemetry)) {
+      return false;
+    }
+    return !this.shouldDelayPromptMutatingDeferredCompaction(telemetry);
+  }
+
+  /** Use the post-TTL catch-up envelope when stale Anthropic debt must override hot-cache smoothing. */
+  private resolveDeferredLeafCompactionExecutionDecision(params: {
+    telemetry: ConversationCompactionTelemetryRecord | null;
+    leafDecision: IncrementalCompactionDecision;
+  }): IncrementalCompactionDecision {
+    if (!this.shouldForceDeferredAnthropicLeafCompaction(params.telemetry, params.leafDecision)) {
+      return params.leafDecision;
+    }
+    return {
+      ...params.leafDecision,
+      maxPasses: Math.max(1, this.config.cacheAwareCompaction.maxColdCacheCatchupPasses),
+      allowCondensedPasses: true,
+    };
+  }
+
   /** Decide whether a hot cache still has enough real token-budget headroom to skip incremental maintenance. */
   private isComfortablyUnderTokenBudget(params: {
     currentTokenCount?: number;
@@ -2294,17 +2329,31 @@ export class LcmContextEngine implements ContextEngine {
               legacyParams: params.legacyParams,
             })
           : await (async (): Promise<CompactResult> => {
+              const telemetry =
+                await this.compactionTelemetryStore.getConversationCompactionTelemetry(
+                  params.conversationId,
+                );
               const leafDecision = await this.evaluateIncrementalCompaction({
                 conversationId: params.conversationId,
                 tokenBudget: resolvedTokenBudget,
                 currentTokenCount: resolvedCurrentTokenCount,
               });
+              const executionLeafDecision =
+                this.resolveDeferredLeafCompactionExecutionDecision({
+                  telemetry,
+                  leafDecision,
+                });
               if (!leafDecision.shouldCompact) {
-                return {
-                  ok: true,
-                  compacted: false,
-                  reason: "deferred compaction no longer needed",
-                };
+                if (executionLeafDecision === leafDecision) {
+                  return {
+                    ok: true,
+                    compacted: false,
+                    reason: "deferred compaction no longer needed",
+                  };
+                }
+                this.deps.log.info(
+                  `[lcm] maintain: deferred Anthropic leaf debt ignoring effective hot-cache state after TTL expiry conversation=${params.conversationId} ${sessionLabel} reason=${leafDecision.reason} retention=${telemetry?.retention ?? "null"} lastCacheTouchAt=${telemetry?.lastCacheTouchAt?.toISOString() ?? "null"}`,
+                );
               }
               return this.executeLeafCompactionCore({
                 conversationId: params.conversationId,
@@ -2314,11 +2363,11 @@ export class LcmContextEngine implements ContextEngine {
                 currentTokenCount: resolvedCurrentTokenCount,
                 runtimeContext: params.runtimeContext,
                 legacyParams: params.legacyParams,
-                maxPasses: leafDecision.maxPasses,
-                leafChunkTokens: leafDecision.leafChunkTokens,
-                fallbackLeafChunkTokens: leafDecision.fallbackLeafChunkTokens,
-                activityBand: leafDecision.activityBand,
-                allowCondensedPasses: leafDecision.allowCondensedPasses,
+                maxPasses: executionLeafDecision.maxPasses,
+                leafChunkTokens: executionLeafDecision.leafChunkTokens,
+                fallbackLeafChunkTokens: executionLeafDecision.fallbackLeafChunkTokens,
+                activityBand: executionLeafDecision.activityBand,
+                allowCondensedPasses: executionLeafDecision.allowCondensedPasses,
               });
             })();
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
