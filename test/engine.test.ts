@@ -11076,4 +11076,274 @@ describe("LcmContextEngine.assemble maxAssemblyTokenBudget cap", () => {
   });
 
 
+
+  it("does not consume summary substring as coverage for volatile live inputs", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-volatile-not-consumed-by-summary";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {});
+    const summaryStore = engine.getSummaryStore();
+
+    // Create a summary that contains text matching a future volatile input.
+    // This simulates an older turn where a similar inter-session event was
+    // summarized — the summary is stale history, NOT the current live input.
+    const repeatedEventContent =
+      "[Internal task completion event]\nChild result: subagent finished processing data.";
+    const oldSummary =
+      "Previous turn context.\n" +
+      "[Internal task completion event]\n" +
+      "Child result: subagent finished processing data.\n" +
+      "End of previous context.";
+    await summaryStore.insertSummary({
+      summaryId: "sum_old_with_event_text",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: oldSummary,
+      tokenCount: estimateTokens(oldSummary),
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_old_with_event_text");
+
+    // A new volatile live input with identical content must NOT be consumed
+    // by the old summary — it's a separate event that the model needs to see.
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:summary-consume sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      repeatedEventContent + "\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: volatileEvent }] as AgentMessage[],
+      tokenBudget: 10_000,
+    });
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content)
+    );
+    // The volatile input must appear explicitly as its own message, not be consumed by the summary.
+    // It may also appear inside the summary content (historical reference), so we
+    // check that it exists as a dedicated volatile-appended entry by verifying
+    // the full OPENCLAW_INTERNAL_CONTEXT wrapper is present.
+    expect(
+      rendered.filter((content) => content.includes("<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>") && content.includes(repeatedEventContent))
+    ).toHaveLength(1);
+    // The old summary should also be present (it's the only assembled context).
+    expect(rendered.some((content) => content.includes("Previous turn context"))).toBe(true);
+  });
+
+  it("matches tool results without tool names against assembled unknown-name results", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-tool-name-unknown-coverage";
+    const conversation = await engine.getConversationStore().getOrCreateConversation(sessionId, {});
+    const summaryStore = engine.getSummaryStore();
+
+    const oldSummary = "old evictable summary before nameless tool result";
+    await summaryStore.insertSummary({
+      summaryId: "sum_old_before_nameless_tool",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: oldSummary,
+      tokenCount: estimateTokens(oldSummary),
+    });
+    await summaryStore.appendContextSummary(conversation.conversationId, "sum_old_before_nameless_tool");
+
+    // Ingest a tool result that will be stored with toolName="unknown"
+    // by the assembler (assembler fills missing tool names with "unknown").
+    const toolCallId = "call_nameless_tool";
+    const toolOutput = "tool output without a real tool name must anchor correctly";
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: toolCallId, name: "unknown", input: {} }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName: "unknown",
+        content: [{ type: "text", text: toolOutput }],
+      } as AgentMessage,
+    });
+
+    // Live volatile input before the tool result, where the live version
+    // has no toolName at all (not even "unknown").
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:nameless-tool sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Child result: volatile input must anchor before nameless tool result.\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [
+        { role: "user", content: volatileEvent },
+        // Live tool result without toolName — should match assembled "unknown"
+        {
+          role: "toolResult",
+          toolCallId,
+          // No toolName — the assembler would fill "unknown" but live has none
+          content: [{ type: "text", text: toolOutput }],
+        } as AgentMessage,
+      ],
+      tokenBudget: 10_000,
+    });
+    const renderedText = result.messages
+      .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content)))
+      .join("\n");
+    // The volatile input must appear BEFORE the tool result in the output.
+    const volatileIndex = renderedText.indexOf("volatile input must anchor before nameless tool result");
+    const toolIndex = renderedText.indexOf("tool output without a real tool name");
+    expect(volatileIndex).toBeGreaterThanOrEqual(0);
+    expect(toolIndex).toBeGreaterThanOrEqual(0);
+    expect(volatileIndex).toBeLessThan(toolIndex);
+  });
+
+  it("appends suppressed fallback retry prompts that lack internal context markers", async () => {
+    const engine = createEngine();
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-fallback-retry-volatile";
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Original task that persisted before retry." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: { role: "assistant", content: "The first model attempt failed." } as AgentMessage,
+    });
+
+    const retryPrompt =
+      "Prior retry context from the session transcript.\n\n" +
+      "[Retry after the previous model attempt failed or timed out]\n\n" +
+      "Original task that persisted before retry.";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [
+        { role: "user", content: "Original task that persisted before retry." },
+        { role: "assistant", content: "The first model attempt failed." },
+        { role: "user", content: retryPrompt },
+      ] as AgentMessage[],
+      tokenBudget: 10_000,
+    });
+
+    const rendered = result.messages.map((message) =>
+      typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+    );
+    expect(rendered.some((content) => content.includes("[Retry after the previous model attempt"))).toBe(
+      true,
+    );
+    expect(rendered.some((content) => content.includes("Prior retry context"))).toBe(true);
+  });
+
+  it("evicts historical tool-call pairs together when volatile input forces trimming", async () => {
+    const engine = createEngineWithConfig({ freshTailCount: 8 });
+    (engine as unknown as { ensureMigrated(): void }).ensureMigrated();
+    const sessionId = "session-volatile-budget-tool-pair";
+    const toolCallId = "call_budget_pair";
+    const toolOutput = "large paired tool output " + "x ".repeat(900);
+
+    await engine.ingest({
+      sessionId,
+      message: { role: "user", content: "Question before tool use." } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: toolCallId, name: "read", input: { path: "big.txt" } }],
+      } as AgentMessage,
+    });
+    await engine.ingest({
+      sessionId,
+      message: {
+        role: "toolResult",
+        toolCallId,
+        toolName: "read",
+        content: [{ type: "text", text: toolOutput }],
+      } as AgentMessage,
+    });
+    for (let index = 0; index < 8; index++) {
+      await engine.ingest({
+        sessionId,
+        message: { role: "user", content: `fresh protected tail message ${index}` } as AgentMessage,
+      });
+    }
+
+    const assembledWithoutVolatile = await engine.assemble({
+      sessionId,
+      messages: [],
+      tokenBudget: 10_000,
+    });
+    expect(
+      assembledWithoutVolatile.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === toolCallId,
+          ),
+      ),
+    ).toBe(true);
+    expect(
+      assembledWithoutVolatile.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === toolCallId,
+      ),
+    ).toBe(true);
+
+    const volatileEvent =
+      "[Inter-session message] sourceSession=agent:main:subagent:budget sourceTool=subagent_announce\n" +
+      "<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>\n" +
+      "[Internal task completion event]\n" +
+      "Child result: volatile input should not leave a synthetic tool repair.\n" +
+      "<<<END_OPENCLAW_INTERNAL_CONTEXT>>>";
+
+    const result = await engine.assemble({
+      sessionId,
+      messages: [{ role: "user", content: volatileEvent }] as AgentMessage[],
+      tokenBudget: assembledWithoutVolatile.estimatedTokens + estimateTokens(volatileEvent) - 50,
+    });
+
+    const rendered = result.messages
+      .map((message) => (typeof message.content === "string" ? message.content : JSON.stringify(message.content)))
+      .join("\n");
+    expect(rendered).toContain("volatile input should not leave a synthetic tool repair");
+    expect(rendered).not.toContain(
+      "[lossless-claw] missing tool result in session history; inserted synthetic error result",
+    );
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          Array.isArray(message.content) &&
+          message.content.some(
+            (block) =>
+              block &&
+              typeof block === "object" &&
+              "id" in block &&
+              (block as { id?: unknown }).id === toolCallId,
+          ),
+      ),
+    ).toBe(false);
+    expect(
+      result.messages.some(
+        (message) =>
+          message.role === "toolResult" &&
+          (message as { toolCallId?: string }).toolCallId === toolCallId,
+      ),
+    ).toBe(false);
+  });
+
 });
