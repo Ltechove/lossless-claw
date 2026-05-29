@@ -5407,6 +5407,7 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
+    allowNoAnchorImportOnCheckpointMissing?: boolean;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     return await this.withSessionQueue(
@@ -5648,8 +5649,14 @@ export class LcmContextEngine implements ContextEngine {
           conversationId: conversation.conversationId,
           historicalMessages,
           skipContentAnchorScan: reason === "same-path-shrink",
-          allowNoAnchorImport: reason === "path-mismatch" || reason === "same-path-shrink",
-          noAnchorImportReason: reason,
+          allowNoAnchorImport:
+            reason === "path-mismatch" ||
+            reason === "same-path-shrink" ||
+            (reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true),
+          noAnchorImportReason:
+            reason === "checkpoint-missing" && params.allowNoAnchorImportOnCheckpointMissing === true
+              ? "rotate-checkpoint-missing"
+              : reason,
         });
         if (reconcile.blockedByImportCap) {
           return { importedMessages: 0, blockedByImportCap: true, hasOverlap: reconcile.hasOverlap };
@@ -8237,11 +8244,45 @@ export class LcmContextEngine implements ContextEngine {
       return empty();
     }
 
+    const reconciledCandidates: StartupAutoRotateCandidate[] = [];
+    let reconcileWarned = 0;
+    for (const candidate of params.candidates) {
+      const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+        sessionId: candidate.sessionId,
+        sessionKey: candidate.sessionKey,
+        sessionFile: candidate.sessionFile,
+      });
+      if (transcriptCoverage.kind === "unavailable") {
+        reconcileWarned += 1;
+        this.logAutoRotateSessionFileDecision({
+          phase: "startup",
+          action: "warn",
+          sessionId: candidate.sessionId,
+          sessionKey: candidate.sessionKey,
+          conversationId: candidate.conversationId,
+          sessionFile: candidate.sessionFile,
+          sizeBytes: candidate.sizeBytes,
+          thresholdBytes: params.thresholdBytes,
+          durationMs: Date.now() - params.startedAt,
+          currentMessageCount: candidate.currentMessageCount,
+          reason: "transcript-reconcile-unavailable",
+          error: transcriptCoverage.reason,
+          level: "warn",
+        });
+        continue;
+      }
+      reconciledCandidates.push(candidate);
+    }
+
+    if (reconciledCandidates.length === 0) {
+      return { ...empty(), warned: reconcileWarned };
+    }
+
     try {
-      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () => {
+      return await this.withStartupAutoRotateSessionQueues(reconciledCandidates, async () => {
         const readyCandidates: StartupAutoRotateCandidate[] = [];
         let preflightWarned = 0;
-        for (const candidate of params.candidates) {
+        for (const candidate of reconciledCandidates) {
           const coverage = await this.compactRawContextOutsideFreshTailForRotate({
             sessionId: candidate.sessionId,
             sessionKey: candidate.sessionKey,
@@ -8408,7 +8449,7 @@ export class LcmContextEngine implements ContextEngine {
             return result;
           },
         );
-        result.warned += preflightWarned;
+        result.warned += preflightWarned + reconcileWarned;
         return result;
       });
     } catch (error) {
@@ -8748,6 +8789,46 @@ export class LcmContextEngine implements ContextEngine {
     };
   }
 
+  /**
+   * Import transcript rows not yet present in LCM before rotate trims JSONL.
+   *
+   * Foreground turns can leave the backing transcript ahead of persisted LCM
+   * rows. Rotate must compact transcript-covered history, not only rows that
+   * happened to be imported before the slash command ran.
+   */
+  private async reconcileRawTranscriptForRotate(params: {
+    sessionId: string;
+    sessionKey: string;
+    sessionFile: string;
+  }): Promise<{ kind: "ready"; importedMessages: number } | { kind: "unavailable"; reason: string }> {
+    try {
+      const result = await this.reconcileTranscriptTailForAfterTurn({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        allowNoAnchorImportOnCheckpointMissing: true,
+      });
+      if (result.blockedByImportCap) {
+        return {
+          kind: "unavailable",
+          reason:
+            "Lossless Claw could not reconcile transcript messages before rotate because the replay import cap was reached.",
+        };
+      }
+      if (result.importedMessages > 0) {
+        this.deps.log.info(
+          `[lcm] rotate: reconciled transcript before summary coverage session=${params.sessionId} sessionKey=${params.sessionKey} sessionFile=${params.sessionFile} importedMessages=${result.importedMessages}`,
+        );
+      }
+      return { kind: "ready", importedMessages: result.importedMessages };
+    } catch (err) {
+      return {
+        kind: "unavailable",
+        reason: `Lossless Claw could not reconcile transcript messages before rotate: ${describeLogError(err)}`,
+      };
+    }
+  }
+
   async rotateSessionStorage(params: {
     sessionId?: string;
     sessionKey?: string;
@@ -8775,6 +8856,14 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.ensureMigrated();
+    const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+      sessionId,
+      sessionKey,
+      sessionFile: params.sessionFile,
+    });
+    if (transcriptCoverage.kind === "unavailable") {
+      return transcriptCoverage;
+    }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
@@ -8893,6 +8982,14 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.ensureMigrated();
+    const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+      sessionId,
+      sessionKey,
+      sessionFile: params.sessionFile,
+    });
+    if (transcriptCoverage.kind === "unavailable") {
+      return transcriptCoverage;
+    }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
