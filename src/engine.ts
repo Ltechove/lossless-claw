@@ -5403,16 +5403,13 @@ export class LcmContextEngine implements ContextEngine {
       : params.messages;
   }
 
-  private async reconcileTranscriptTailForAfterTurn(params: {
+  private async reconcileTranscriptTailForAfterTurnInSessionQueue(params: {
     sessionId: string;
     sessionKey?: string;
     sessionFile: string;
     allowNoAnchorImportOnCheckpointMissing?: boolean;
   }): Promise<TranscriptReconcileResult> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    return await this.withSessionQueue(
-      queueKey,
-      async () => {
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -5690,7 +5687,18 @@ export class LcmContextEngine implements ContextEngine {
           blockedByImportCap: false,
           hasOverlap: reconcile.hasOverlap,
         };
-      },
+  }
+
+  private async reconcileTranscriptTailForAfterTurn(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    allowNoAnchorImportOnCheckpointMissing?: boolean;
+  }): Promise<TranscriptReconcileResult> {
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    return await this.withSessionQueue(
+      queueKey,
+      () => this.reconcileTranscriptTailForAfterTurnInSessionQueue(params),
       {
         operationName: "afterTurnTranscriptReconcile",
         context: [
@@ -8244,75 +8252,8 @@ export class LcmContextEngine implements ContextEngine {
       return empty();
     }
 
-    const reconciledCandidates: StartupAutoRotateCandidate[] = [];
-    let reconcileWarned = 0;
-    for (const candidate of params.candidates) {
-      const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
-        sessionId: candidate.sessionId,
-        sessionKey: candidate.sessionKey,
-        sessionFile: candidate.sessionFile,
-      });
-      if (transcriptCoverage.kind === "unavailable") {
-        reconcileWarned += 1;
-        this.logAutoRotateSessionFileDecision({
-          phase: "startup",
-          action: "warn",
-          sessionId: candidate.sessionId,
-          sessionKey: candidate.sessionKey,
-          conversationId: candidate.conversationId,
-          sessionFile: candidate.sessionFile,
-          sizeBytes: candidate.sizeBytes,
-          thresholdBytes: params.thresholdBytes,
-          durationMs: Date.now() - params.startedAt,
-          currentMessageCount: candidate.currentMessageCount,
-          reason: "transcript-reconcile-unavailable",
-          error: transcriptCoverage.reason,
-          level: "warn",
-        });
-        continue;
-      }
-      reconciledCandidates.push(candidate);
-    }
-
-    if (reconciledCandidates.length === 0) {
-      return { ...empty(), warned: reconcileWarned };
-    }
-
     try {
-      return await this.withStartupAutoRotateSessionQueues(reconciledCandidates, async () => {
-        const readyCandidates: StartupAutoRotateCandidate[] = [];
-        let preflightWarned = 0;
-        for (const candidate of reconciledCandidates) {
-          const coverage = await this.compactRawContextOutsideFreshTailForRotate({
-            sessionId: candidate.sessionId,
-            sessionKey: candidate.sessionKey,
-          });
-          if (coverage.kind === "unavailable") {
-            preflightWarned += 1;
-            this.logAutoRotateSessionFileDecision({
-              phase: "startup",
-              action: "warn",
-              sessionId: candidate.sessionId,
-              sessionKey: candidate.sessionKey,
-              conversationId: candidate.conversationId,
-              sessionFile: candidate.sessionFile,
-              sizeBytes: candidate.sizeBytes,
-              thresholdBytes: params.thresholdBytes,
-              durationMs: Date.now() - params.startedAt,
-              currentMessageCount: candidate.currentMessageCount,
-              reason: "coverage-unavailable",
-              error: coverage.reason,
-              level: "warn",
-            });
-            continue;
-          }
-          readyCandidates.push(candidate);
-        }
-
-        if (readyCandidates.length === 0) {
-          return { ...empty(), warned: preflightWarned };
-        }
-
+      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () => {
         const result = await withExclusiveDatabaseLock(
           this.db,
           { timeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS },
@@ -8371,7 +8312,59 @@ export class LcmContextEngine implements ContextEngine {
               backupPath,
               backupCreated,
             };
-            for (const candidate of readyCandidates) {
+            for (const candidate of params.candidates) {
+              const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+                sessionId: candidate.sessionId,
+                sessionKey: candidate.sessionKey,
+                sessionFile: candidate.sessionFile,
+                sessionQueueAlreadyHeld: true,
+              });
+              if (transcriptCoverage.kind === "unavailable") {
+                result.warned += 1;
+                this.logAutoRotateSessionFileDecision({
+                  phase: "startup",
+                  action: "warn",
+                  sessionId: candidate.sessionId,
+                  sessionKey: candidate.sessionKey,
+                  conversationId: candidate.conversationId,
+                  sessionFile: candidate.sessionFile,
+                  sizeBytes: candidate.sizeBytes,
+                  thresholdBytes: params.thresholdBytes,
+                  durationMs: Date.now() - params.startedAt,
+                  backupPath,
+                  currentMessageCount: candidate.currentMessageCount,
+                  reason: "transcript-reconcile-unavailable",
+                  error: transcriptCoverage.reason,
+                  level: "warn",
+                });
+                continue;
+              }
+
+              const coverage = await this.compactRawContextOutsideFreshTailForRotate({
+                sessionId: candidate.sessionId,
+                sessionKey: candidate.sessionKey,
+              });
+              if (coverage.kind === "unavailable") {
+                result.warned += 1;
+                this.logAutoRotateSessionFileDecision({
+                  phase: "startup",
+                  action: "warn",
+                  sessionId: candidate.sessionId,
+                  sessionKey: candidate.sessionKey,
+                  conversationId: candidate.conversationId,
+                  sessionFile: candidate.sessionFile,
+                  sizeBytes: candidate.sizeBytes,
+                  thresholdBytes: params.thresholdBytes,
+                  durationMs: Date.now() - params.startedAt,
+                  backupPath,
+                  currentMessageCount: candidate.currentMessageCount,
+                  reason: "coverage-unavailable",
+                  error: coverage.reason,
+                  level: "warn",
+                });
+                continue;
+              }
+
               let rotateResult: RotateSessionStorageResult;
               try {
                 rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
@@ -8449,7 +8442,6 @@ export class LcmContextEngine implements ContextEngine {
             return result;
           },
         );
-        result.warned += preflightWarned + reconcileWarned;
         return result;
       });
     } catch (error) {
@@ -8800,19 +8792,30 @@ export class LcmContextEngine implements ContextEngine {
     sessionId: string;
     sessionKey: string;
     sessionFile: string;
+    sessionQueueAlreadyHeld?: boolean;
   }): Promise<{ kind: "ready"; importedMessages: number } | { kind: "unavailable"; reason: string }> {
     try {
-      const result = await this.reconcileTranscriptTailForAfterTurn({
+      const reconcileParams = {
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         sessionFile: params.sessionFile,
         allowNoAnchorImportOnCheckpointMissing: true,
-      });
+      };
+      const result = params.sessionQueueAlreadyHeld
+        ? await this.reconcileTranscriptTailForAfterTurnInSessionQueue(reconcileParams)
+        : await this.reconcileTranscriptTailForAfterTurn(reconcileParams);
       if (result.blockedByImportCap) {
         return {
           kind: "unavailable",
           reason:
             "Lossless Claw could not reconcile transcript messages before rotate because the replay import cap was reached.",
+        };
+      }
+      if (!result.hasOverlap && result.importedMessages === 0) {
+        return {
+          kind: "unavailable",
+          reason:
+            "Lossless Claw could not prove transcript coverage before rotate because transcript reconciliation found no safe overlap and imported no messages.",
         };
       }
       if (result.importedMessages > 0) {
@@ -8856,17 +8859,19 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.ensureMigrated();
-    const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
-      sessionId,
-      sessionKey,
-      sessionFile: params.sessionFile,
-    });
-    if (transcriptCoverage.kind === "unavailable") {
-      return transcriptCoverage;
-    }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
+        const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+          sessionId,
+          sessionKey,
+          sessionFile: params.sessionFile,
+          sessionQueueAlreadyHeld: true,
+        });
+        if (transcriptCoverage.kind === "unavailable") {
+          return transcriptCoverage;
+        }
+
         const coverage = await this.compactRawContextOutsideFreshTailForRotate({
           sessionId,
           sessionKey,
@@ -8982,25 +8987,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     this.ensureMigrated();
-    const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
-      sessionId,
-      sessionKey,
-      sessionFile: params.sessionFile,
-    });
-    if (transcriptCoverage.kind === "unavailable") {
-      return transcriptCoverage;
-    }
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
-        const coverage = await this.compactRawContextOutsideFreshTailForRotate({
-          sessionId,
-          sessionKey,
-        });
-        if (coverage.kind === "unavailable") {
-          return coverage;
-        }
-
         try {
           return await withExclusiveDatabaseLock(
             this.db,
@@ -9048,6 +9037,36 @@ export class LcmContextEngine implements ContextEngine {
                   currentConversationId: current.conversationId,
                   currentMessageCount,
                   reason: "Lossless Claw could not create the rotate backup.",
+                };
+              }
+
+              const transcriptCoverage = await this.reconcileRawTranscriptForRotate({
+                sessionId,
+                sessionKey,
+                sessionFile: params.sessionFile,
+                sessionQueueAlreadyHeld: true,
+              });
+              if (transcriptCoverage.kind === "unavailable") {
+                return {
+                  kind: "unavailable" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  backupPath,
+                  reason: transcriptCoverage.reason,
+                };
+              }
+
+              const coverage = await this.compactRawContextOutsideFreshTailForRotate({
+                sessionId,
+                sessionKey,
+              });
+              if (coverage.kind === "unavailable") {
+                return {
+                  kind: "unavailable" as const,
+                  currentConversationId: current.conversationId,
+                  currentMessageCount,
+                  backupPath,
+                  reason: coverage.reason,
                 };
               }
 

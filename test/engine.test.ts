@@ -3997,6 +3997,110 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("refuses to rotate when transcript reconciliation has no safe overlap", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-no-overlap");
+    const sessionKey = "agent:main:rotate-no-overlap";
+    const sessionId = "rotate-storage-no-overlap-session";
+    const transcriptMessages = [
+      { role: "user", content: [{ type: "text", text: "uncovered old user" }] },
+      { role: "assistant", content: [{ type: "text", text: "uncovered old assistant" }] },
+      { role: "user", content: [{ type: "text", text: "tail user" }] },
+      { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+    ] as AgentMessage[];
+    writeLeafTranscriptMessages(sessionFile, transcriptMessages);
+    const originalTranscript = readFileSync(sessionFile, "utf8");
+    const engine = createEngineWithConfig({ freshTailCount: 2 });
+
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId,
+      sessionKey,
+    });
+    expect(await engine.getConversationStore().getMessageCount(conversation.conversationId)).toBe(0);
+
+    const rotate = await engine.rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile,
+    });
+
+    expect(rotate.kind).toBe("unavailable");
+    expect(rotate.reason).toContain("could not prove transcript coverage");
+    expect(readFileSync(sessionFile, "utf8")).toBe(originalTranscript);
+  });
+
+  it("takes the rotate backup before reconciling transcript-only rows", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-backup-before-reconcile");
+    const sessionKey = "agent:main:rotate-backup-before-reconcile";
+    const sessionId = "rotate-storage-backup-before-reconcile-session";
+    const transcriptMessages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "CRABPOT_LCM_FACT is blue-lantern-42." }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "noted" }] },
+      { role: "user", content: [{ type: "text", text: "older detail before rotate" }] },
+      { role: "assistant", content: [{ type: "text", text: "older answer before rotate" }] },
+      { role: "user", content: [{ type: "text", text: "tail user" }] },
+      { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+    ] as AgentMessage[];
+    const sm = SessionManager.open(sessionFile);
+    for (const message of transcriptMessages.slice(0, 2)) {
+      sm.appendMessage(message);
+    }
+
+    const engine = createEngineWithConfig({
+      freshTailCount: 2,
+      leafChunkTokens: 1,
+      leafMinFanout: 1,
+    });
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 2,
+    });
+    for (const message of transcriptMessages.slice(2)) {
+      sm.appendMessage(message);
+    }
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const rotate = await engine.rotateSessionStorageWithBackup({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      lockTimeoutMs: 1_000,
+    });
+    expect(rotate).toMatchObject({
+      kind: "rotated",
+      currentConversationId: conversation!.conversationId,
+      currentMessageCount: 2,
+      preservedTailMessageCount: 2,
+    });
+    if (rotate.kind !== "rotated") {
+      throw new Error(`Expected rotate to succeed, received ${rotate.kind}`);
+    }
+
+    const backupDb = createLcmDatabaseConnection(rotate.backupPath);
+    try {
+      const backedUpMessageCount = backupDb
+        .prepare(`SELECT COUNT(*) AS count FROM messages WHERE conversation_id = ?`)
+        .get(conversation!.conversationId) as { count: number };
+      expect(backedUpMessageCount.count).toBe(2);
+    } finally {
+      closeLcmConnection(backupDb);
+    }
+
+    expect(await engine.getConversationStore().getMessageCount(conversation!.conversationId)).toBe(6);
+    expect(readSessionMessages(sessionFile).map((message) => (message.content[0] as { text: string }).text)).toEqual([
+      "tail user",
+      "tail assistant",
+    ]);
+  });
+
   it("waits for an in-flight managed transaction before backing up and rotating", async () => {
     const sessionFile = createSessionFilePath("lcm-rotate-storage-wait");
     const sessionManager = SessionManager.inMemory(process.cwd());
