@@ -3755,6 +3755,87 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("summarizes raw context outside the fresh tail before rotating the transcript", async () => {
+    const sessionFile = createSessionFilePath("lcm-rotate-storage-leaf-coverage");
+    const sessionKey = "agent:main:rotate-leaf-coverage";
+    const sessionId = "rotate-storage-leaf-coverage-session";
+    const sm = SessionManager.open(sessionFile);
+    const originalMessages = [
+      {
+        role: "user",
+        content: [{ type: "text", text: "CRABPOT_LCM_FACT is blue-lantern-42." }],
+      },
+      { role: "assistant", content: [{ type: "text", text: "noted" }] },
+      { role: "user", content: [{ type: "text", text: "older detail before rotate" }] },
+      { role: "assistant", content: [{ type: "text", text: "older answer before rotate" }] },
+      { role: "user", content: [{ type: "text", text: "tail user" }] },
+      { role: "assistant", content: [{ type: "text", text: "tail assistant" }] },
+    ] as AgentMessage[];
+    for (const message of originalMessages) {
+      sm.appendMessage(message);
+    }
+
+    const engine = createEngineWithConfig({
+      freshTailCount: 2,
+      leafChunkTokens: 1,
+      leafMinFanout: 1,
+    });
+
+    const first = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(first).toEqual({
+      bootstrapped: true,
+      importedMessages: 6,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const contextItemsBeforeRotate = await engine
+      .getSummaryStore()
+      .getContextItems(conversation!.conversationId);
+    expect(contextItemsBeforeRotate.filter((item) => item.itemType === "message")).toHaveLength(6);
+
+    const rotate = await engine.rotateSessionStorage({
+      sessionId,
+      sessionKey,
+      sessionFile,
+    });
+    expect(rotate).toMatchObject({
+      kind: "rotated",
+      conversationId: conversation!.conversationId,
+      preservedTailMessageCount: 2,
+    });
+    const contextItems = await engine.getSummaryStore().getContextItems(conversation!.conversationId);
+    expect(contextItems.slice(0, -2).every((item) => item.itemType === "summary")).toBe(true);
+    expect(contextItems.slice(-2).map((item) => item.itemType)).toEqual(["message", "message"]);
+    const summaryItem = contextItems.find((item) => item.itemType === "summary");
+    expect(summaryItem?.summaryId).toBeTypeOf("string");
+    const summary = await engine.getSummaryStore().getSummary(summaryItem!.summaryId!);
+    expect(summary?.content).toContain("blue-lantern-42");
+
+    const storedMessages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(storedMessages.map((message) => message.content)).toEqual(
+      originalMessages.map((message) => (message.content[0] as { text: string }).text),
+    );
+
+    const rotatedBranchMessages = readSessionMessages(sessionFile);
+    expect(rotatedBranchMessages.map((message) => (message.content[0] as { text: string }).text)).toEqual([
+      "tail user",
+      "tail assistant",
+    ]);
+
+    const assembled = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: rotatedBranchMessages,
+      tokenBudget: 4000,
+      prompt: "What is CRABPOT_LCM_FACT?",
+    });
+    expect(assembled.messages.some((message) => message.content.includes("blue-lantern-42"))).toBe(true);
+  });
+
   it("waits for an in-flight managed transaction before backing up and rotating", async () => {
     const sessionFile = createSessionFilePath("lcm-rotate-storage-wait");
     const sessionManager = SessionManager.inMemory(process.cwd());

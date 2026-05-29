@@ -8238,8 +8238,41 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () =>
-        withExclusiveDatabaseLock(
+      return await this.withStartupAutoRotateSessionQueues(params.candidates, async () => {
+        const readyCandidates: StartupAutoRotateCandidate[] = [];
+        let preflightWarned = 0;
+        for (const candidate of params.candidates) {
+          const coverage = await this.compactRawContextOutsideFreshTailForRotate({
+            sessionId: candidate.sessionId,
+            sessionKey: candidate.sessionKey,
+          });
+          if (coverage.kind === "unavailable") {
+            preflightWarned += 1;
+            this.logAutoRotateSessionFileDecision({
+              phase: "startup",
+              action: "warn",
+              sessionId: candidate.sessionId,
+              sessionKey: candidate.sessionKey,
+              conversationId: candidate.conversationId,
+              sessionFile: candidate.sessionFile,
+              sizeBytes: candidate.sizeBytes,
+              thresholdBytes: params.thresholdBytes,
+              durationMs: Date.now() - params.startedAt,
+              currentMessageCount: candidate.currentMessageCount,
+              reason: "coverage-unavailable",
+              error: coverage.reason,
+              level: "warn",
+            });
+            continue;
+          }
+          readyCandidates.push(candidate);
+        }
+
+        if (readyCandidates.length === 0) {
+          return { ...empty(), warned: preflightWarned };
+        }
+
+        const result = await withExclusiveDatabaseLock(
           this.db,
           { timeoutMs: AUTO_ROTATE_DATABASE_LOCK_TIMEOUT_MS },
           async () => {
@@ -8297,7 +8330,7 @@ export class LcmContextEngine implements ContextEngine {
               backupPath,
               backupCreated,
             };
-            for (const candidate of params.candidates) {
+            for (const candidate of readyCandidates) {
               let rotateResult: RotateSessionStorageResult;
               try {
                 rotateResult = await this.rotateSessionStorageWhileHoldingDatabaseLock({
@@ -8374,8 +8407,10 @@ export class LcmContextEngine implements ContextEngine {
             }
             return result;
           },
-        )
-      );
+        );
+        result.warned += preflightWarned;
+        return result;
+      });
     } catch (error) {
       if (error instanceof DatabaseTransactionTimeoutError) {
         this.logAutoRotateSessionFileDecision({
@@ -8636,6 +8671,83 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
+  /**
+   * Summarize raw context that would be removed from the host transcript.
+   *
+   * Rotate only preserves the configured fresh tail in JSONL. Before rewriting
+   * that file, force leaf-only compaction until every older raw context item has
+   * been replaced by a leaf summary. This avoids unrelated condensation work
+   * while making the transcript trim depend on LCM summary coverage.
+   */
+  private async compactRawContextOutsideFreshTailForRotate(params: {
+    sessionId: string;
+    sessionKey: string;
+  }): Promise<
+    | { kind: "ready"; conversationId: number; leafPasses: number }
+    | { kind: "unavailable"; reason: string }
+  > {
+    const current = await this.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!current?.active) {
+      return {
+        kind: "unavailable",
+        reason: "No active Lossless Claw conversation is stored for the current session.",
+      };
+    }
+
+    const initialContextItems = await this.summaryStore.getContextItems(current.conversationId);
+    const leafTrigger = await this.compaction.evaluateLeafTrigger(current.conversationId, 1);
+    if (leafTrigger.rawTokensOutsideTail <= 0) {
+      return { kind: "ready", conversationId: current.conversationId, leafPasses: 0 };
+    }
+
+    const maxLeafPasses = initialContextItems.filter((item) => item.itemType === "message").length;
+    if (maxLeafPasses === 0) {
+      return { kind: "ready", conversationId: current.conversationId, leafPasses: 0 };
+    }
+
+    const { summarize, summaryModel } = await this.resolveSummarize({
+      legacyParams: this.buildSummarizerLegacyParams({ sessionKey: params.sessionKey }),
+      breakerScope: "rotate",
+    });
+    const tokenBudget = this.applyAssemblyBudgetCap(128_000);
+    let leafPasses = 0;
+
+    while (leafPasses <= maxLeafPasses) {
+      const result = await this.compaction.compactLeaf({
+        conversationId: current.conversationId,
+        tokenBudget,
+        summarize,
+        force: true,
+        allowCondensedPasses: false,
+        summaryModel,
+      });
+      if (!result.actionTaken) {
+        if (result.authFailure) {
+          return {
+            kind: "unavailable",
+            reason: "Lossless Claw could not summarize raw context before rotate because the summary provider rejected authentication.",
+          };
+        }
+        if (leafPasses > 0) {
+          this.deps.log.info(
+            `[lcm] rotate: summarized raw context before transcript rewrite conversation=${current.conversationId} session=${params.sessionId} sessionKey=${params.sessionKey} leafPasses=${leafPasses}`,
+          );
+        }
+        return { kind: "ready", conversationId: current.conversationId, leafPasses };
+      }
+      leafPasses += 1;
+    }
+
+    return {
+      kind: "unavailable",
+      reason:
+        "Lossless Claw stopped rotate before rewriting the transcript because raw context outside the fresh tail could not be fully summarized.",
+    };
+  }
+
   async rotateSessionStorage(params: {
     sessionId?: string;
     sessionKey?: string;
@@ -8665,14 +8777,22 @@ export class LcmContextEngine implements ContextEngine {
     this.ensureMigrated();
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
-      async () =>
-        this.conversationStore.withTransaction(() =>
+      async () => {
+        const coverage = await this.compactRawContextOutsideFreshTailForRotate({
+          sessionId,
+          sessionKey,
+        });
+        if (coverage.kind === "unavailable") {
+          return coverage;
+        }
+        return this.conversationStore.withTransaction(() =>
           this.rotateSessionStorageInActiveTransaction({
             sessionId,
             sessionKey,
             sessionFile: params.sessionFile,
-          })
-        ),
+          }),
+        );
+      },
     );
   }
 
@@ -8776,6 +8896,14 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(sessionId, sessionKey),
       async () => {
+        const coverage = await this.compactRawContextOutsideFreshTailForRotate({
+          sessionId,
+          sessionKey,
+        });
+        if (coverage.kind === "unavailable") {
+          return coverage;
+        }
+
         try {
           return await withExclusiveDatabaseLock(
             this.db,
