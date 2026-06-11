@@ -1,6 +1,6 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { mkdir, open, stat, writeFile } from "node:fs/promises";
+import { open, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -17,6 +17,9 @@ import type {
 } from "./openclaw-bridge.js";
 import { contentFromParts, ContextAssembler, pickToolCallId, pickToolIsError, pickToolName } from "./assembler.js";
 import { CompactionEngine, type CompactionConfig } from "./compaction.js";
+import { BatchDeduplicator } from "./batch-dedup.js";
+import { CompactionGuards } from "./compaction-guards.js";
+import { LargeFileInterceptor } from "./large-file-interceptor.js";
 import type { LcmConfig } from "./db/config.js";
 import { getLcmDbFeatures } from "./db/features.js";
 import { runLcmMigrations } from "./db/migration.js";
@@ -27,14 +30,6 @@ import {
   resolveDelegatedExpansionGrantId,
   revokeDelegatedExpansionGrantForSession,
 } from "./expansion-auth.js";
-import {
-  extensionFromNameOrMime,
-  formatFileReference,
-  formatRawPayloadReference,
-  formatToolOutputReference,
-  generateExplorationSummary,
-  parseFileBlocks,
-} from "./large-files.js";
 import { describeLogError } from "./lcm-log.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
@@ -50,15 +45,8 @@ import { ConversationStore, type ConversationRecord } from "./store/conversation
 import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
-import {
-  createLcmSummarizeFromLegacyParams,
-  extractProviderAuthFailure,
-  FALLBACK_SUMMARY_MARKER,
-  LcmProviderAuthError,
-  LcmSummarySpendLimitError,
-  type LcmSummarizeFn,
-} from "./summarize.js";
-import type { CompleteFn, LcmDependencies, StartupSessionFileCandidate } from "./types.js";
+import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
+import type { LcmDependencies, StartupSessionFileCandidate } from "./types.js";
 import { estimateTokens } from "./estimate-tokens.js";
 import { buildDeterministicFallbackSummary } from "./summary-fallback.js";
 import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
@@ -71,14 +59,14 @@ import { resolveEpochRoute, selectEntryIdTail, transcriptImportCap } from "./rec
 import { describeAssembledPrefixChange, formatOverflowDiagnosticsForLog, shouldLogOverflowDiagnostics, type AssemblePrefixSnapshot, type BootstrapImportObservation } from "./assemble-debug.js";
 import { appendForkBoundedLiveSuffixWithinBudget, buildDegradedLiveAssembleResult, buildForkBoundedLiveFallback, clampMessagesToSerializedBudget, resolveDeferredAssemblyPressure } from "./assemble-fallback.js";
 import { resolveBootstrapMaxTokens, trimBootstrapMessagesToBudget } from "./bootstrap-budget.js";
-import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, isHeartbeatOkContent, turnLooksLikeHeartbeatTurn } from "./heartbeat-filter.js";
+import { batchLooksLikeHeartbeatAckTurn, filterSyntheticHeartbeatMessages, isHeartbeatNoiseContent, pruneHeartbeatOkTurns } from "./heartbeat-filter.js";
 import { appendUncoveredVolatileLiveInputsWithinBudget, isVolatileLiveInputMessage, messageContentCoveredBySummary, resolveProtectedFreshTailAssembledIndexes } from "./live-coverage.js";
-import { RAW_PAYLOAD_EXTERNALIZATION_REASON, buildMessageParts, extractMessageContent, extractStructuredText, filterPersistableMessages, hasPersistableMessageRole, hasReplayCriticalRawBlock, isLikelyInjectedDeliveryOnlyTranscript, isLikelyInjectedMetadataPreambleRecord, isOpenClawRuntimeContextLeak, serializeRawPayloadContent, toStoredMessage, type StoredMessage } from "./message-content.js";
+import { buildMessageParts, extractMessageContent, filterPersistableMessages, hasPersistableMessageRole, isLikelyInjectedDeliveryOnlyTranscript, isLikelyInjectedMetadataPreambleRecord, isOpenClawRuntimeContextLeak, toStoredMessage, type StoredMessage } from "./message-content.js";
 import { createBootstrapEntryHash, createLosslessMessageSignature, isBootstrapReplayCandidateMessage, messageIdentity, readBootstrapMessageFromJsonLine } from "./message-signatures.js";
 import { PROMPT_RECALL_MAX_MESSAGES, PROMPT_RECALL_SEARCH_CANDIDATE_LIMIT, buildPromptRecallProjectionFingerprint, extractPromptRecallIdentifiers, extractPromptRecallSnippet, findPromptRecallIdentifierIndex, isPromptRecallEligibleRole, normalizePromptRecallCoverageText, normalizePromptRecallText, renderPromptRecallMessage } from "./prompt-recall.js";
 import { externalizedReplayMetadataMatches, extractPlainToolReplayTextsById, extractRawBlockIdsFromPartMetadata, extractRawBlockSignatureFromPartMetadata, extractRawIdsFromPartMetadata, listTranscriptToolResultEntryIdsByCallId } from "./replay-metadata.js";
 import { estimateSessionTokenCountForAfterTurn, extractRuntimePromptTokenCount } from "./token-accounting.js";
-import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, safeBoolean, safeString } from "./value-utils.js";
+import { asRecord, formatDurationMs, isMissingFileError, normalizeSessionFilePathForComparison, resolvePositiveInteger, safeBoolean, safeString } from "./value-utils.js";
 
 type AgentMessage = Parameters<ContextEngine["ingest"]>[0]["message"];
 const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
@@ -118,11 +106,6 @@ const FLUSH_LAG_ADOPTION_TAIL_WINDOW = 16;
 const AMBIGUOUS_ROLLOVER_OVERLAP_WIDE_WINDOW = 500;
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
-type CircuitBreakerState = {
-  failures: number;
-  openSince: number | null;
-};
-
 type SummarySpendGuardState = {
   windowStartedAt: number;
   calls: number;
@@ -442,11 +425,14 @@ export class LcmContextEngine implements ContextEngine {
    */
   private lastFullReadFileState = new Map<number, { size: number; mtimeMs: number }>();
 
-  // ── Circuit breaker for compaction auth failures ──
-  private circuitBreakerStates = new Map<string, CircuitBreakerState>();
+  // ── Circuit breaker + summary spend guard ───────────────────────────────
+  private readonly compactionGuards: CompactionGuards;
 
-  // ── Non-auth spend guard for model-backed summarization calls ───────────
-  private summarySpendGuardStates = new Map<string, SummarySpendGuardState>();
+  // ── Large-payload interception at ingest ────────────────────────────────
+  private readonly largeFileInterceptor: LargeFileInterceptor;
+
+  // ── After-turn batch replay dedup ────────────────────────────────────────
+  private readonly batchDeduplicator: BatchDeduplicator;
 
   /** Last file state successfully covered by `reconcileTranscriptTailForAfterTurn`
    *  slow-path full re-reads, keyed by `${sessionQueueKey}\u0000${sessionFile}`
@@ -468,6 +454,7 @@ export class LcmContextEngine implements ContextEngine {
   constructor(deps: LcmDependencies, database: DatabaseSync) {
     this.deps = deps;
     this.config = deps.config;
+    this.compactionGuards = new CompactionGuards(this.config, this.deps);
     this.ignoreSessionPatterns = compileSessionPatterns(this.config.ignoreSessionPatterns);
     this.statelessSessionPatterns = compileSessionPatterns(this.config.statelessSessionPatterns);
     this.db = database;
@@ -540,6 +527,12 @@ export class LcmContextEngine implements ContextEngine {
       replayFloodThresholdInternal: this.config.replayFloodThresholdInternal,
     });
     this.summaryStore = new SummaryStore(this.db, { fts5Available: this.fts5Available });
+    this.largeFileInterceptor = new LargeFileInterceptor(
+      this.config,
+      this.summaryStore,
+      (params) => this.resolveLargeFileTextSummarizer(params),
+    );
+    this.batchDeduplicator = new BatchDeduplicator(this.conversationStore, this.deps);
     this.focusBriefStore = new FocusBriefStore(this.db);
     this.compactionTelemetryStore = new CompactionTelemetryStore(this.db);
     this.compactionMaintenanceStore = new CompactionMaintenanceStore(this.db);
@@ -645,281 +638,13 @@ export class LcmContextEngine implements ContextEngine {
     return matchesSessionPattern(trimmedKey, this.statelessSessionPatterns);
   }
 
-  // ── Circuit breaker helpers ──────────────────────────────────────────────
-
-  private getCircuitBreakerState(key: string): CircuitBreakerState {
-    let state = this.circuitBreakerStates.get(key);
-    if (!state) {
-      state = { failures: 0, openSince: null };
-      this.circuitBreakerStates.set(key, state);
-    }
-    return state;
-  }
-
-  private isCircuitBreakerOpen(key: string): boolean {
-    const state = this.circuitBreakerStates.get(key);
-    if (!state || state.openSince === null) return false;
-    const elapsed = Date.now() - state.openSince;
-    if (elapsed >= this.config.circuitBreakerCooldownMs) {
-      this.resetCircuitBreaker(key);
-      return false;
-    }
-    return true;
-  }
-
-  private recordCompactionAuthFailure(key: string): void {
-    const state = this.getCircuitBreakerState(key);
-    state.failures++;
-    const halfThreshold = Math.ceil(this.config.circuitBreakerThreshold / 2);
-    if (state.failures === halfThreshold && state.failures < this.config.circuitBreakerThreshold) {
-      this.deps.log.warn(
-        `[lcm] WARNING: compaction degraded — ${state.failures}/${this.config.circuitBreakerThreshold} consecutive auth failures for ${key}`,
-      );
-    }
-    if (state.failures >= this.config.circuitBreakerThreshold) {
-      state.openSince = Date.now();
-      const cooldownMin = Math.round(this.config.circuitBreakerCooldownMs / 60000);
-      this.deps.log.warn(
-        `[lcm] CIRCUIT BREAKER OPEN: compaction disabled for ${key}. Auto-retry in ${cooldownMin}m. LCM is operating in degraded mode.`,
-      );
-    }
-  }
-
-  private recordCompactionSuccess(key: string): void {
-    const state = this.circuitBreakerStates.get(key);
-    if (!state) {
-      return;
-    }
-    if (state.failures > 0 || state.openSince !== null) {
-      this.deps.log.info(
-        `[lcm] compaction circuit breaker CLOSED: successful compaction for ${key} after ${state.failures} prior failures.`,
-      );
-    }
-    this.resetCircuitBreaker(key);
-  }
-
-  private resetCircuitBreaker(key: string): void {
-    this.circuitBreakerStates.delete(key);
-  }
-
-  private resolvePositiveConfigInteger(value: unknown, fallback: number): number {
-    return typeof value === "number" && Number.isFinite(value) && value > 0
-      ? Math.floor(value)
-      : fallback;
-  }
-
-  private resolveSummarySpendGuardConfig(): {
-    windowMs: number;
-    maxCalls: number;
-    backoffMs: number;
-  } {
-    return {
-      windowMs: this.resolvePositiveConfigInteger(
-        this.config.summaryCallWindowMs,
-        10 * 60 * 1000,
-      ),
-      maxCalls: this.resolvePositiveConfigInteger(
-        this.config.summaryMaxCallsPerWindow,
-        24,
-      ),
-      backoffMs: this.resolvePositiveConfigInteger(
-        this.config.summarySpendBackoffMs,
-        30 * 60 * 1000,
-      ),
-    };
-  }
-
-  private resolveSummarySpendScope(params: {
-    kind: "compaction" | "large-file" | "custom";
-    scope: string | undefined;
-  }): string {
-    const scope = params.scope?.trim() || "global";
-    return `${params.kind}:${scope}`;
-  }
-
-  private openSummarySpendBackoff(params: {
-    scopeKey: string;
-    reason: string;
-    now?: number;
-  }): Date {
-    const now = params.now ?? Date.now();
-    const { backoffMs } = this.resolveSummarySpendGuardConfig();
-    const state = this.summarySpendGuardStates.get(params.scopeKey) ?? {
-      windowStartedAt: now,
-      calls: 0,
-      backoffUntil: null,
-      lastReason: null,
-    };
-    state.backoffUntil = now + backoffMs;
-    state.lastReason = params.reason;
-    this.summarySpendGuardStates.set(params.scopeKey, state);
-    return new Date(state.backoffUntil);
-  }
-
   /**
    * Operation-wide deadline for chaining threshold sweeps within a single
    * compact() attempt. Reuses the compactUntilUnder operation deadline so
    * both recovery loops share one wall-clock contract.
    */
   private resolveSweepChainDeadlineMs(): number {
-    return this.resolvePositiveConfigInteger(this.config.compactUntilUnderDeadlineMs, 300_000);
-  }
-
-  /**
-   * Clear an open spend backoff for a scope, returning the prior expiry if
-   * one was open. Used by user-initiated compaction: an explicit repair
-   * request is informed consent to spend, so it must not silently no-op
-   * behind a backoff opened by an earlier automatic attempt.
-   */
-  private clearSummarySpendBackoff(scopeKey: string): Date | null {
-    const state = this.summarySpendGuardStates.get(scopeKey);
-    if (!state?.backoffUntil || state.backoffUntil <= Date.now()) {
-      return null;
-    }
-    const previous = new Date(state.backoffUntil);
-    state.backoffUntil = null;
-    state.lastReason = null;
-    state.windowStartedAt = Date.now();
-    state.calls = 0;
-    return previous;
-  }
-
-  private assertSummarySpendCallAllowed(params: {
-    scopeKey: string;
-    reason: string;
-  }): void {
-    const now = Date.now();
-    const { windowMs, maxCalls } = this.resolveSummarySpendGuardConfig();
-    let state = this.summarySpendGuardStates.get(params.scopeKey);
-    if (state?.backoffUntil !== null && state?.backoffUntil !== undefined) {
-      if (now < state.backoffUntil) {
-        throw new LcmSummarySpendLimitError({
-          scopeKey: params.scopeKey,
-          backoffUntil: new Date(state.backoffUntil),
-        });
-      }
-      state.windowStartedAt = now;
-      state.calls = 0;
-      state.backoffUntil = null;
-      state.lastReason = null;
-    }
-
-    if (!state || now - state.windowStartedAt >= windowMs) {
-      state = {
-        windowStartedAt: now,
-        calls: 0,
-        backoffUntil: null,
-        lastReason: null,
-      };
-      this.summarySpendGuardStates.set(params.scopeKey, state);
-    }
-
-    if (state.calls >= maxCalls) {
-      const backoffUntil = this.openSummarySpendBackoff({
-        scopeKey: params.scopeKey,
-        reason: params.reason,
-        now,
-      });
-      this.deps.log.warn(
-        `[lcm] summary spend guard opened scope=${params.scopeKey} calls=${state.calls}/${maxCalls} reason=${params.reason.replaceAll(" ", "_")} backoffUntil=${backoffUntil.toISOString()}`,
-      );
-      throw new LcmSummarySpendLimitError({
-        scopeKey: params.scopeKey,
-        backoffUntil,
-      });
-    }
-
-    state.lastReason = params.reason;
-  }
-
-  private recordSummarySpendCall(params: {
-    scopeKey: string;
-    reason: string;
-  }): void {
-    const now = Date.now();
-    const { windowMs } = this.resolveSummarySpendGuardConfig();
-    let state = this.summarySpendGuardStates.get(params.scopeKey);
-    if (!state || now - state.windowStartedAt >= windowMs) {
-      state = {
-        windowStartedAt: now,
-        calls: 0,
-        backoffUntil: null,
-        lastReason: null,
-      };
-      this.summarySpendGuardStates.set(params.scopeKey, state);
-    }
-    state.calls += 1;
-    state.lastReason = params.reason;
-  }
-
-  private getSummarySpendBackoffUntil(scopeKey: string): Date | null {
-    const state = this.summarySpendGuardStates.get(scopeKey);
-    if (!state?.backoffUntil) {
-      return null;
-    }
-    return state.backoffUntil > Date.now() ? new Date(state.backoffUntil) : null;
-  }
-
-  private buildSummarySpendGuardedDeps(params: {
-    scopeKey: string;
-    reason: string;
-  }): LcmDependencies {
-    const complete: CompleteFn = async (input) => {
-      this.assertSummarySpendCallAllowed({
-        scopeKey: params.scopeKey,
-        reason: params.reason,
-      });
-      try {
-        const result = await this.deps.complete(input);
-        if (!extractProviderAuthFailure(result, { requireStructuralSignal: true })) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
-        }
-        return result;
-      } catch (err) {
-        if (!extractProviderAuthFailure(err)) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: params.reason,
-          });
-        }
-        throw err;
-      }
-    };
-    return {
-      ...this.deps,
-      complete,
-    };
-  }
-
-  private guardCustomSummarize(params: {
-    summarize: LcmSummarizeFn;
-    scopeKey: string;
-  }): LcmSummarizeFn {
-    return async (text, aggressive, options) => {
-      this.assertSummarySpendCallAllowed({
-        scopeKey: params.scopeKey,
-        reason: "custom summarizer call",
-      });
-      try {
-        const result = await params.summarize(text, aggressive, options);
-        this.recordSummarySpendCall({
-          scopeKey: params.scopeKey,
-          reason: "custom summarizer call",
-        });
-        return result;
-      } catch (err) {
-        if (!(err instanceof LcmProviderAuthError)) {
-          this.recordSummarySpendCall({
-            scopeKey: params.scopeKey,
-            reason: "custom summarizer call",
-          });
-        }
-        throw err;
-      }
-    };
+    return resolvePositiveInteger(this.config.compactUntilUnderDeadlineMs, 300_000);
   }
 
   /** Ensure DB schema is up-to-date. Called lazily on first bootstrap/ingest/assemble/compact. */
@@ -1251,7 +976,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
@@ -1333,7 +1058,7 @@ export class LcmContextEngine implements ContextEngine {
       `session=${params.sessionId}`,
       ...(params.sessionKey?.trim() ? [`sessionKey=${params.sessionKey.trim()}`] : []),
     ].join(" ");
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
@@ -1433,7 +1158,7 @@ export class LcmContextEngine implements ContextEngine {
           ? null
           : result.reason ?? "deferred compaction failed";
       const summarySpendBackoffUntil = keepPending
-        ? this.getSummarySpendBackoffUntil(summarySpendScopeKey)
+        ? this.compactionGuards.getSummarySpendBackoffUntil(summarySpendScopeKey)
         : null;
       await this.compactionMaintenanceStore.markProactiveCompactionFinished({
         conversationId: params.conversationId,
@@ -1569,12 +1294,12 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     const compactionScope = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    const summarySpendScopeKey = this.resolveSummarySpendScope({
+    const summarySpendScopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: compactionScope,
     });
     if (manualCompactionRequested) {
-      const clearedBackoffUntil = this.clearSummarySpendBackoff(summarySpendScopeKey);
+      const clearedBackoffUntil = this.compactionGuards.clearSummarySpendBackoff(summarySpendScopeKey);
       if (clearedBackoffUntil) {
         this.deps.log.info(
           `[lcm] compact: manual request cleared summary spend backoff conversation=${params.conversationId} ${sessionLabel} scope=${summarySpendScopeKey} previousBackoffUntil=${clearedBackoffUntil.toISOString()}`,
@@ -1589,7 +1314,7 @@ export class LcmContextEngine implements ContextEngine {
       customInstructions: params.customInstructions,
       breakerScope: compactionScope,
     });
-    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+    if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
         ok: true,
         compacted: false,
@@ -1748,7 +1473,7 @@ export class LcmContextEngine implements ContextEngine {
       let chainedSweeps = 1;
       let lastRoundMadeProgress = sweepResult.actionTaken === true;
       const sweepChainDeadlineAt = startedAt + this.resolveSweepChainDeadlineMs();
-      const maxChainedSweeps = this.resolvePositiveConfigInteger(
+      const maxChainedSweeps = resolvePositiveInteger(
         this.config.maxSweepIterations,
         12,
       );
@@ -1790,9 +1515,9 @@ export class LcmContextEngine implements ContextEngine {
       }
 
       if (sweepResult.authFailure && breakerKey) {
-        this.recordCompactionAuthFailure(breakerKey);
+        this.compactionGuards.recordCompactionAuthFailure(breakerKey);
       } else if (sweepResult.actionTaken && breakerKey) {
-        this.recordCompactionSuccess(breakerKey);
+        this.compactionGuards.recordCompactionSuccess(breakerKey);
       }
       if (sweepResult.actionTaken) {
         await this.markLeafCompactionTelemetrySuccess({ conversationId });
@@ -1863,7 +1588,7 @@ export class LcmContextEngine implements ContextEngine {
             `[lcm] compact: spend backoff skipped conversation=${conversationId} ${sessionLabel} scope=${summarySpendScopeKey} reason=still_progressing chainedSweeps=${chainedSweeps} tokensAfter=${sweepResult.tokensAfter}`,
           );
         } else {
-          this.openSummarySpendBackoff({
+          this.compactionGuards.openSummarySpendBackoff({
             scopeKey: summarySpendScopeKey,
             reason: sweepReason,
           });
@@ -1944,9 +1669,9 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (compactResult.authFailure && breakerKey) {
-      this.recordCompactionAuthFailure(breakerKey);
+      this.compactionGuards.recordCompactionAuthFailure(breakerKey);
     } else if (compactResult.rounds > 0 && breakerKey) {
-      this.recordCompactionSuccess(breakerKey);
+      this.compactionGuards.recordCompactionSuccess(breakerKey);
     }
 
     const didCompact = compactResult.rounds > 0;
@@ -1964,7 +1689,7 @@ export class LcmContextEngine implements ContextEngine {
           : "already under target"
         : "could not reach target";
     if (!compactResult.success && !compactResult.authFailure) {
-      this.openSummarySpendBackoff({
+      this.compactionGuards.openSummarySpendBackoff({
         scopeKey: summarySpendScopeKey,
         reason: compactUntilReason,
       });
@@ -2062,13 +1787,13 @@ export class LcmContextEngine implements ContextEngine {
   }> {
     const lp = params.legacyParams ?? {};
     const breakerScope = params.breakerScope || "global";
-    const scopeKey = this.resolveSummarySpendScope({
+    const scopeKey = this.compactionGuards.resolveSummarySpendScope({
       kind: "compaction",
       scope: breakerScope,
     });
     if (typeof lp.summarize === "function") {
       return {
-        summarize: this.guardCustomSummarize({
+        summarize: this.compactionGuards.guardCustomSummarize({
           summarize: lp.summarize as LcmSummarizeFn,
           scopeKey,
         }),
@@ -2082,7 +1807,7 @@ export class LcmContextEngine implements ContextEngine {
           ? params.customInstructions
           : (this.config.customInstructions || undefined);
       const runtimeSummarizer = await createLcmSummarizeFromLegacyParams({
-        deps: this.buildSummarySpendGuardedDeps({
+        deps: this.compactionGuards.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "compaction summarizer call",
         }),
@@ -2122,7 +1847,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     try {
-      const scopeKey = this.resolveSummarySpendScope({
+      const scopeKey = this.compactionGuards.resolveSummarySpendScope({
         kind: "large-file",
         scope:
           typeof params?.conversationId === "number"
@@ -2130,7 +1855,7 @@ export class LcmContextEngine implements ContextEngine {
             : "global",
       });
       const result = await createLcmSummarizeFromLegacyParams({
-        deps: this.buildSummarySpendGuardedDeps({
+        deps: this.compactionGuards.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "large-file summarizer call",
         }),
@@ -2169,647 +1894,6 @@ export class LcmContextEngine implements ContextEngine {
 
   // ── Image detection & externalization ──────────────────────────────────────
 
-  private static readonly BASE64_IMAGE_MAGIC: ReadonlyArray<{
-    prefix: string;
-    extension: string;
-    mimeType: string;
-  }> = [
-    { prefix: "/9j/", extension: "jpg", mimeType: "image/jpeg" },
-    { prefix: "iVBOR", extension: "png", mimeType: "image/png" },
-    { prefix: "R0lGOD", extension: "gif", mimeType: "image/gif" },
-    { prefix: "UklGR", extension: "webp", mimeType: "image/webp" },
-    { prefix: "PHN2Zy", extension: "svg", mimeType: "image/svg+xml" },
-  ];
-
-  private static detectBase64ImageType(
-    base64Data: string,
-  ): { extension: string; mimeType: string } | null {
-    for (const sig of LcmContextEngine.BASE64_IMAGE_MAGIC) {
-      if (base64Data.startsWith(sig.prefix)) {
-        return { extension: sig.extension, mimeType: sig.mimeType };
-      }
-    }
-    return null;
-  }
-
-  private static extensionForImageMimeType(mimeType: string): string | null {
-    switch (mimeType.toLowerCase()) {
-      case "image/jpeg":
-      case "image/jpg":
-        return "jpg";
-      case "image/png":
-        return "png";
-      case "image/gif":
-        return "gif";
-      case "image/webp":
-        return "webp";
-      case "image/svg+xml":
-        return "svg";
-      case "image/heic":
-        return "heic";
-      case "image/avif":
-        return "avif";
-      case "image/bmp":
-        return "bmp";
-      default:
-        return null;
-    }
-  }
-
-  private static normalizeNativeImageBlock(value: unknown): {
-    base64Data: string;
-    extension: string;
-    mimeType: string;
-  } | null {
-    const record = asRecord(value);
-    if (!record || record.type !== "image") {
-      return null;
-    }
-
-    const rawData = safeString(record.data);
-    if (!rawData) {
-      return null;
-    }
-
-    const dataUrlMatch = rawData.match(/^data:([^;,]+);base64,(.*)$/s);
-    const declaredMimeType =
-      dataUrlMatch?.[1] ??
-      safeString(record.mimeType) ??
-      safeString(record.mime_type) ??
-      safeString(record.mediaType) ??
-      safeString(record.media_type);
-    const base64Data = (dataUrlMatch?.[2] ?? rawData).replace(/\s+/g, "");
-    if (!base64Data || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data)) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
-    const mimeType = detected?.mimeType ?? declaredMimeType;
-    if (!mimeType?.toLowerCase().startsWith("image/")) {
-      return null;
-    }
-
-    const extension = detected?.extension ?? LcmContextEngine.extensionForImageMimeType(mimeType);
-    return extension ? { base64Data, extension, mimeType } : null;
-  }
-
-  private static basenameForImageReference(pathLike: string): string | null {
-    const baseName = pathLike.trim().split(/[\\/]/).filter(Boolean).pop();
-    if (!baseName) {
-      return null;
-    }
-    return baseName.replace(/[^\w.\-@]+/g, "_") || null;
-  }
-
-  private static inferNativeImageFileName(params: {
-    content: unknown[];
-    imageIndex: number;
-    extension: string;
-    role?: string;
-  }): string {
-    for (let index = params.imageIndex - 1; index >= 0; index -= 1) {
-      const entry = asRecord(params.content[index]);
-      const text = entry?.type === "text" ? safeString(entry.text) : undefined;
-      if (!text) {
-        continue;
-      }
-
-      const mediaMatch = text.match(/\[media attached(?:\s+\d+\/\d+)?:\s*([^\s\]|()]+)/i);
-      const fileName = mediaMatch?.[1]
-        ? LcmContextEngine.basenameForImageReference(mediaMatch[1])
-        : null;
-      if (fileName) {
-        return fileName;
-      }
-    }
-
-    const rolePrefix =
-      params.role === "assistant"
-        ? "assistant"
-        : params.role === "system"
-          ? "system"
-          : params.role === "tool" || params.role === "toolResult"
-            ? "tool"
-            : "user";
-    return `${rolePrefix}-image.${params.extension}`;
-  }
-
-  private static isExternalizedImageReference(value: string): boolean {
-    if (typeof value !== "string") return false;
-    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(value.trim());
-  }
-
-  private static isExternalizedReferenceContent(value: string): boolean {
-    const trimmed = value.trim();
-    return (
-      trimmed.startsWith("[LCM File:") ||
-      trimmed.startsWith("[LCM Tool Output:") ||
-      trimmed.includes("LCM file: file_") ||
-      LcmContextEngine.IMAGE_REFERENCE_REGEX_GLOBAL.test(trimmed)
-    );
-  }
-
-  /** Image references emitted by `externalizeImage` can use either role-specific
-   *  labels (`User image`, `Assistant image`, `System image`, `Tool image`) or
-   *  the generic `Image` label used by pure-base64 user/system content. */
-  private static readonly IMAGE_REFERENCE_REGEX =
-    /^\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]$/;
-  private static readonly IMAGE_REFERENCE_REGEX_GLOBAL =
-    /\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*LCM file: file_[a-f0-9]{16}\]/;
-
-  /** Stricter form of `isExternalizedReferenceContent` used by the
-   *  raw-payload externalizer's skip gate. Returns true when the message's
-   *  stored content was produced by a *wholesale-replacement* externalizer
-   *  (large-file / tool-output / raw-payload — each emits content that
-   *  starts with the canonical reference header, optionally followed by an
-   *  exploration-summary preamble), or when the whole trimmed content is a
-   *  single image-only reference (rare).
-   *
-   *  Mixed content like `"...intro... [User image: file_xyz] ... long body
-   *  text..."` is NOT considered wholly externalized — those messages must
-   *  remain eligible for raw-payload externalization when they exceed the
-   *  size threshold. */
-  private static isWhollyExternalizedReferenceContent(value: string): boolean {
-    const trimmed = value.trim();
-    if (trimmed.length === 0) return false;
-    if (
-      trimmed.startsWith("[LCM File:") ||
-      trimmed.startsWith("[LCM Tool Output:") ||
-      trimmed.startsWith("[LCM Raw Payload:")
-    ) {
-      return true;
-    }
-    return LcmContextEngine.IMAGE_REFERENCE_REGEX.test(trimmed);
-  }
-
-  /** Resolve the configured externalized-payload directory for one conversation. */
-  private largeFilesDirForConversation(conversationId: number): string {
-    return join(this.config.largeFilesDir, String(conversationId));
-  }
-
-  private async storeImageFileContent(params: {
-    conversationId: number;
-    fileId: string;
-    extension: string;
-    base64Data: string;
-  }): Promise<string> {
-    const dir = this.largeFilesDirForConversation(params.conversationId);
-    await mkdir(dir, { recursive: true });
-    const normalized = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "bin";
-    const filePath = join(dir, `${params.fileId}.${normalized}`);
-    const buffer = Buffer.from(params.base64Data, "base64");
-    await writeFile(filePath, buffer);
-    return filePath;
-  }
-
-  private async externalizeImage(params: {
-    conversationId: number;
-    base64Data: string;
-    fileName?: string;
-    extension: string;
-    mimeType: string;
-    label: string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
-    const fileId = `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const byteSize = Buffer.from(params.base64Data, "base64").byteLength;
-    const storageUri = await this.storeImageFileContent({
-      conversationId: params.conversationId,
-      fileId,
-      extension: params.extension,
-      base64Data: params.base64Data,
-    });
-    const fileName = params.fileName ?? `image.${params.extension}`;
-    const summary = `Image file (${params.extension.toUpperCase()}, ${byteSize.toLocaleString("en-US")} bytes)${params.fileName ? ` — ${params.fileName}` : ""}`;
-
-    await this.summaryStore.insertLargeFile({
-      fileId,
-      conversationId: params.conversationId,
-      fileName,
-      mimeType: params.mimeType,
-      byteSize,
-      storageUri,
-      explorationSummary: summary,
-    });
-
-    const reference = `[${params.label}: ${fileName} (${params.mimeType}, ${byteSize.toLocaleString("en-US")} bytes) | LCM file: ${fileId}]`;
-    return { fileId, byteSize, summary, reference };
-  }
-
-  private async interceptNativeImageBlocks(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (!("content" in params.message)) {
-      return null;
-    }
-    const role = (params.message as { role?: unknown }).role;
-    // Cover every persistable role — `hasPersistableMessageRole` accepts
-    // user/assistant/system/tool/toolResult, so this gate must too. A system
-    // message carrying native `{type:"image"}` blocks would otherwise fall
-    // through to the generic raw-payload externalizer and be stored as a
-    // `raw-system-payload.json` blob with embedded base64.
-    if (
-      role !== "user" &&
-      role !== "assistant" &&
-      role !== "system" &&
-      role !== "tool" &&
-      role !== "toolResult"
-    ) {
-      return null;
-    }
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const label =
-      role === "assistant"
-        ? "Assistant image"
-        : role === "system"
-          ? "System image"
-          : role === "tool" || role === "toolResult"
-            ? "Tool image"
-            : "User image";
-
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (let index = 0; index < params.message.content.length; index += 1) {
-      const block = params.message.content[index];
-      const image = LcmContextEngine.normalizeNativeImageBlock(block);
-      if (!image) {
-        rewrittenContent.push(block);
-        continue;
-      }
-
-      const externalized = await this.externalizeImage({
-        conversationId: params.conversationId,
-        base64Data: image.base64Data,
-        fileName: LcmContextEngine.inferNativeImageFileName({
-          content: params.message.content,
-          imageIndex: index,
-          extension: image.extension,
-          role: typeof role === "string" ? role : undefined,
-        }),
-        extension: image.extension,
-        mimeType: image.mimeType,
-        label,
-      });
-
-      rewrittenContent.push({ type: "text", text: externalized.reference });
-      fileIds.push(externalized.fileId);
-      changed = true;
-    }
-
-    if (!changed) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  private async interceptInlineImages(params: {
-    conversationId: number;
-    content: string;
-    role: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const mediaResult = await this.interceptUserMediaBase64(params);
-    if (mediaResult) {
-      return mediaResult;
-    }
-    return this.interceptPureBase64Image(params);
-  }
-
-  private async interceptUserMediaBase64(params: {
-    conversationId: number;
-    content: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const prefix = "[media attached:";
-    if (!params.content.startsWith(prefix)) {
-      return null;
-    }
-
-    const base64LineRe = /\n([A-Za-z0-9+/]{20,}={0,2})\n/m;
-    const base64Match = base64LineRe.exec(params.content);
-    if (!base64Match) {
-      return null;
-    }
-
-    const headerEnd = base64Match.index + 1;
-    const header = params.content.slice(0, headerEnd).trim();
-    const base64Data = params.content.slice(headerEnd);
-
-    if (estimateTokens(base64Data) < 100) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(base64Data);
-    if (!detected) {
-      return null;
-    }
-
-    const pathMatch = header.match(/\[media attached:\s*([^\s(]+)/);
-    const fileName = pathMatch ? pathMatch[1] : `user-image.${detected.extension}`;
-
-    const externalized = await this.externalizeImage({
-      conversationId: params.conversationId,
-      base64Data,
-      fileName,
-      extension: detected.extension,
-      mimeType: detected.mimeType,
-      label: "User image",
-    });
-
-    return {
-      rewrittenContent: `${header}\n\n${externalized.reference}`,
-      fileIds: [externalized.fileId],
-    };
-  }
-
-  private async interceptPureBase64Image(params: {
-    conversationId: number;
-    content: string;
-    role: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const trimmed = params.content.trim();
-    if (estimateTokens(trimmed) < 100) {
-      return null;
-    }
-
-    const detected = LcmContextEngine.detectBase64ImageType(trimmed);
-    if (!detected) {
-      return null;
-    }
-
-    const b64Chars = trimmed.replace(/[^A-Za-z0-9+/=\s]/g, "");
-    if (b64Chars.length / trimmed.length < 0.8) {
-      return null;
-    }
-
-    const label = params.role === "tool" ? "Tool image" :
-                  params.role === "assistant" ? "Assistant image" : "Image";
-    const fileName = `${params.role}-image.${detected.extension}`;
-
-    const externalized = await this.externalizeImage({
-      conversationId: params.conversationId,
-      base64Data: trimmed,
-      fileName,
-      extension: detected.extension,
-      mimeType: detected.mimeType,
-      label,
-    });
-
-    return {
-      rewrittenContent: externalized.reference,
-      fileIds: [externalized.fileId],
-    };
-  }
-
-  /**
-   * Walk tool-result payload blocks and replace pure inline image strings with
-   * compact references before generic text-output externalization runs.
-   */
-  private async rewriteToolInlineImageValue(params: {
-    conversationId: number;
-    value: unknown;
-  }): Promise<{ rewrittenValue: unknown; fileIds: string[]; changed: boolean }> {
-    if (typeof params.value === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: params.value,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return { rewrittenValue: params.value, fileIds: [], changed: false };
-      }
-      return {
-        rewrittenValue: intercepted.rewrittenContent,
-        fileIds: intercepted.fileIds,
-        changed: true,
-      };
-    }
-
-    if (Array.isArray(params.value)) {
-      const rewrittenValues: unknown[] = [];
-      const fileIds: string[] = [];
-      let changed = false;
-
-      for (const entry of params.value) {
-        const rewritten = await this.rewriteToolInlineImageValue({
-          conversationId: params.conversationId,
-          value: entry,
-        });
-        rewrittenValues.push(rewritten.rewrittenValue);
-        fileIds.push(...rewritten.fileIds);
-        changed ||= rewritten.changed;
-      }
-
-      return changed
-        ? { rewrittenValue: rewrittenValues, fileIds, changed: true }
-        : { rewrittenValue: params.value, fileIds: [], changed: false };
-    }
-
-    if (!params.value || typeof params.value !== "object") {
-      return { rewrittenValue: params.value, fileIds: [], changed: false };
-    }
-
-    const record = params.value as Record<string, unknown>;
-    if (record.type === "text" && typeof record.text === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: record.text,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return { rewrittenValue: params.value, fileIds: [], changed: false };
-      }
-      return {
-        rewrittenValue: {
-          ...record,
-          text: intercepted.rewrittenContent,
-        },
-        fileIds: intercepted.fileIds,
-        changed: true,
-      };
-    }
-
-    const nestedKeys = ["output", "content", "result"] as const;
-    const rewrittenRecord: Record<string, unknown> = { ...record };
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (const key of nestedKeys) {
-      if (!(key in record)) {
-        continue;
-      }
-      const rewritten = await this.rewriteToolInlineImageValue({
-        conversationId: params.conversationId,
-        value: record[key],
-      });
-      if (!rewritten.changed) {
-        continue;
-      }
-      rewrittenRecord[key] = rewritten.rewrittenValue;
-      fileIds.push(...rewritten.fileIds);
-      changed = true;
-    }
-
-    return changed
-      ? { rewrittenValue: rewrittenRecord, fileIds, changed: true }
-      : { rewrittenValue: params.value, fileIds: [], changed: false };
-  }
-
-  private async interceptInlineImagesInToolMessage(params: {
-    conversationId: number;
-    message: AgentMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (
-      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
-      !("content" in params.message)
-    ) {
-      return null;
-    }
-
-    if (typeof params.message.content === "string") {
-      const intercepted = await this.interceptPureBase64Image({
-        conversationId: params.conversationId,
-        content: params.message.content,
-        role: "tool",
-      });
-      if (!intercepted) {
-        return null;
-      }
-      return {
-        rewrittenMessage: {
-          ...params.message,
-          content: intercepted.rewrittenContent,
-        } as AgentMessage,
-        fileIds: intercepted.fileIds,
-      };
-    }
-
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let changed = false;
-
-    for (const item of params.message.content) {
-      const rewritten = await this.rewriteToolInlineImageValue({
-        conversationId: params.conversationId,
-        value: item,
-      });
-      rewrittenContent.push(rewritten.rewrittenValue);
-      fileIds.push(...rewritten.fileIds);
-      changed ||= rewritten.changed;
-    }
-
-    if (!changed) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  /** Persist intercepted large-file text payloads to the configured lcm-files directory. */
-  private async storeLargeFileContent(params: {
-    conversationId: number;
-    fileId: string;
-    extension: string;
-    content: string;
-  }): Promise<string> {
-    const dir = this.largeFilesDirForConversation(params.conversationId);
-    await mkdir(dir, { recursive: true });
-
-    const normalizedExtension = params.extension.replace(/[^a-z0-9]/gi, "").toLowerCase() || "txt";
-    const filePath = join(dir, `${params.fileId}.${normalizedExtension}`);
-    await writeFile(filePath, params.content, "utf8");
-    return filePath;
-  }
-
-  /** Persist a large text payload and return the resulting compact placeholder. */
-  private async externalizeLargeTextPayload(params: {
-    conversationId: number;
-    content: string;
-    fileId?: string;
-    fileName?: string;
-    mimeType?: string;
-    formatReference: (input: { fileId: string; byteSize: number; summary: string }) => string;
-  }): Promise<{ fileId: string; byteSize: number; summary: string; reference: string }> {
-    if (params.fileId) {
-      const existing = await this.summaryStore.getLargeFile(params.fileId);
-      if (existing) {
-        const byteSize = existing.byteSize ?? Buffer.byteLength(params.content, "utf8");
-        const summary =
-          existing.explorationSummary ??
-          `${params.fileName ?? "large payload"} (${byteSize.toLocaleString("en-US")} bytes)`;
-        return {
-          fileId: existing.fileId,
-          byteSize,
-          summary,
-          reference: params.formatReference({
-            fileId: existing.fileId,
-            byteSize,
-            summary,
-          }),
-        };
-      }
-    }
-
-    const summarizeText = await this.resolveLargeFileTextSummarizer({
-      conversationId: params.conversationId,
-    });
-    const fileId = params.fileId ?? `file_${randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const extension = extensionFromNameOrMime(params.fileName, params.mimeType);
-    const storageUri = await this.storeLargeFileContent({
-      conversationId: params.conversationId,
-      fileId,
-      extension,
-      content: params.content,
-    });
-    const byteSize = Buffer.byteLength(params.content, "utf8");
-    const explorationSummary = await generateExplorationSummary({
-      content: params.content,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      summarizeText,
-    });
-
-    await this.summaryStore.insertLargeFile({
-      fileId,
-      conversationId: params.conversationId,
-      fileName: params.fileName,
-      mimeType: params.mimeType,
-      byteSize,
-      storageUri,
-      explorationSummary,
-    });
-
-    return {
-      fileId,
-      byteSize,
-      summary: explorationSummary,
-      reference: params.formatReference({
-        fileId,
-        byteSize,
-        summary: explorationSummary,
-      }),
-    };
-  }
 
   /**
    * Return the most recent assembled snapshot for a conversation and refresh its
@@ -2866,304 +1950,6 @@ export class LcmContextEngine implements ContextEngine {
     }
   }
 
-  /**
-   * Intercept oversized <file> blocks before persistence and replace them with
-   * compact file references backed by large_files records.
-   */
-  private async interceptLargeFiles(params: {
-    conversationId: number;
-    content: string;
-  }): Promise<{ rewrittenContent: string; fileIds: string[] } | null> {
-    const blocks = parseFileBlocks(params.content);
-    if (blocks.length === 0) {
-      return null;
-    }
-
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const fileIds: string[] = [];
-    const rewrittenSegments: string[] = [];
-    let cursor = 0;
-    let interceptedAny = false;
-
-    for (const block of blocks) {
-      const blockTokens = estimateTokens(block.text);
-      if (blockTokens < threshold) {
-        continue;
-      }
-
-      interceptedAny = true;
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: block.text,
-        fileName: block.fileName,
-        mimeType: block.mimeType,
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatFileReference({
-            fileId,
-            fileName: block.fileName,
-            mimeType: block.mimeType,
-            byteSize,
-            summary,
-          }),
-      });
-
-      rewrittenSegments.push(params.content.slice(cursor, block.start));
-      rewrittenSegments.push(externalized.reference);
-      cursor = block.end;
-      fileIds.push(externalized.fileId);
-    }
-
-    if (!interceptedAny) {
-      return null;
-    }
-
-    rewrittenSegments.push(params.content.slice(cursor));
-    return {
-      rewrittenContent: rewrittenSegments.join(""),
-      fileIds,
-    };
-  }
-
-  /** Externalize oversized textual tool outputs before they are persisted inline. */
-  private async interceptLargeToolResults(params: {
-    conversationId: number;
-    message: AgentMessage;
-    getFileId?: (input: { content: string; toolName: string; callId?: string }) => string;
-  }): Promise<{ rewrittenMessage: AgentMessage; fileIds: string[] } | null> {
-    if (
-      (params.message.role !== "toolResult" && params.message.role !== "tool") ||
-      !("content" in params.message)
-    ) {
-      return null;
-    }
-
-    // Convert string content to array format for unified processing.
-    if (typeof params.message.content === "string") {
-      params = {
-        ...params,
-        message: {
-          ...params.message,
-          content: [{ type: "text", text: params.message.content }],
-        } as AgentMessage,
-      };
-    }
-
-    if (!Array.isArray(params.message.content)) {
-      return null;
-    }
-
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    const rewrittenContent: unknown[] = [];
-    const fileIds: string[] = [];
-    let interceptedAny = false;
-    const topLevel = params.message as Record<string, unknown>;
-    const topLevelToolCallId =
-      safeString(topLevel.toolCallId) ??
-      safeString(topLevel.tool_call_id) ??
-      safeString(topLevel.toolUseId) ??
-      safeString(topLevel.tool_use_id) ??
-      safeString(topLevel.call_id) ??
-      safeString(topLevel.id);
-    const topLevelToolName =
-      safeString(topLevel.toolName) ??
-      safeString(topLevel.tool_name);
-    const topLevelIsError =
-      safeBoolean(topLevel.isError) ??
-      safeBoolean(topLevel.is_error);
-
-    for (const item of params.message.content) {
-      if (!item || typeof item !== "object" || Array.isArray(item)) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const record = item as Record<string, unknown>;
-      const rawType = safeString(record.type);
-      const isStructuredToolResult =
-        rawType !== "tool_result" &&
-        rawType !== "toolResult" &&
-        rawType !== "function_call_output";
-      const isPlainTextToolResult =
-        rawType === "text" &&
-        typeof record.text === "string";
-      if (isStructuredToolResult && !isPlainTextToolResult) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      const textSource =
-        isPlainTextToolResult
-          ? record.text
-          : record.output !== undefined
-          ? record.output
-          : record.content !== undefined
-            ? record.content
-            : record;
-      const extractedText = extractStructuredText(textSource);
-      if (
-        typeof extractedText === "string" &&
-        LcmContextEngine.isExternalizedImageReference(extractedText)
-      ) {
-        rewrittenContent.push(item);
-        continue;
-      }
-      if (typeof extractedText !== "string" || estimateTokens(extractedText) < threshold) {
-        rewrittenContent.push(item);
-        continue;
-      }
-
-      interceptedAny = true;
-      const toolName =
-        safeString(record.name) ??
-        topLevelToolName ??
-        "tool-result";
-      const callId =
-        safeString(record.tool_use_id) ??
-        safeString(record.toolUseId) ??
-        safeString(record.tool_call_id) ??
-        safeString(record.toolCallId) ??
-        safeString(record.call_id) ??
-        safeString(record.id) ??
-        topLevelToolCallId;
-      const externalized = await this.externalizeLargeTextPayload({
-        conversationId: params.conversationId,
-        content: extractedText,
-        fileId: params.getFileId?.({ content: extractedText, toolName, callId }),
-        fileName: `${toolName}.txt`,
-        mimeType: "text/plain",
-        formatReference: ({ fileId, byteSize, summary }) =>
-          formatToolOutputReference({
-            fileId,
-            toolName,
-            byteSize,
-            summary,
-          }),
-      });
-
-      const normalizedRawType =
-        rawType === "function_call_output" ? "function_call_output" : "tool_result";
-      const compactBlock: Record<string, unknown> = isPlainTextToolResult
-        ? {
-            type: "text",
-            text: externalized.reference,
-            rawType: normalizedRawType,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          }
-        : {
-            type: normalizedRawType,
-            output: externalized.reference,
-            externalizedFileId: externalized.fileId,
-            originalByteSize: externalized.byteSize,
-            toolOutputExternalized: true,
-            externalizationReason: "large_tool_result",
-          };
-      if (callId) {
-        if (normalizedRawType === "function_call_output") {
-          compactBlock.call_id = callId;
-        } else {
-          compactBlock.tool_use_id = callId;
-        }
-      }
-      if (typeof record.is_error === "boolean") {
-        compactBlock.is_error = record.is_error;
-      } else if (typeof record.isError === "boolean") {
-        compactBlock.isError = record.isError;
-      } else if (typeof topLevelIsError === "boolean") {
-        compactBlock.isError = topLevelIsError;
-      }
-      if (toolName) {
-        compactBlock.name = toolName;
-      }
-
-      rewrittenContent.push(compactBlock);
-      fileIds.push(externalized.fileId);
-    }
-
-    if (!interceptedAny) {
-      return null;
-    }
-
-    return {
-      rewrittenMessage: {
-        ...params.message,
-        content: rewrittenContent,
-      } as AgentMessage,
-      fileIds,
-    };
-  }
-
-  /** Externalize oversized raw messages that survived role-specific interceptors. */
-  private async interceptLargeRawPayload(params: {
-    conversationId: number;
-    message: AgentMessage;
-    stored: StoredMessage;
-  }): Promise<{ rewrittenMessage: AgentMessage; stored: StoredMessage } | null> {
-    const threshold = Math.max(1, this.config.largeFileTokenThreshold);
-    if (params.stored.tokenCount < threshold) {
-      return null;
-    }
-    if (params.stored.role === "tool") {
-      return null;
-    }
-    // Skip when this message has already been raw-payload-externalized, or
-    // when its whole stored content is just an externalized reference.
-    // Mixed content that embeds an image reference alongside other oversized
-    // content remains eligible for raw-payload externalization.
-    const externalizedFlag = (
-      params.message as { rawPayloadExternalized?: unknown }
-    ).rawPayloadExternalized;
-    if (externalizedFlag === true) {
-      return null;
-    }
-    if (LcmContextEngine.isWhollyExternalizedReferenceContent(params.stored.content)) {
-      return null;
-    }
-    if ("content" in params.message && hasReplayCriticalRawBlock(params.message.content)) {
-      return null;
-    }
-
-    const rawPayload = serializeRawPayloadContent(params.message, params.stored.content);
-    if (!rawPayload || rawPayload.content.length === 0) {
-      return null;
-    }
-
-    const role = typeof params.message.role === "string" ? params.message.role : params.stored.role;
-    const externalized = await this.externalizeLargeTextPayload({
-      conversationId: params.conversationId,
-      content: rawPayload.content,
-      fileName: `raw-${role}-payload.${rawPayload.mimeType === "application/json" ? "json" : "txt"}`,
-      mimeType: rawPayload.mimeType,
-      formatReference: ({ fileId, byteSize, summary }) =>
-        formatRawPayloadReference({
-          fileId,
-          role,
-          byteSize,
-          reason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
-          summary,
-        }),
-    });
-
-    const rewrittenMessage = {
-      ...params.message,
-      content: externalized.reference,
-      rawPayloadExternalized: true,
-      externalizedFileId: externalized.fileId,
-      originalByteSize: externalized.byteSize,
-      externalizationReason: RAW_PAYLOAD_EXTERNALIZATION_REASON,
-    } as AgentMessage;
-
-    return {
-      rewrittenMessage,
-      stored: {
-        ...params.stored,
-        content: externalized.reference,
-        tokenCount: estimateTokens(externalized.reference),
-      },
-    };
-  }
 
   // ── ContextEngine interface ─────────────────────────────────────────────
 
@@ -5904,7 +4690,7 @@ export class LcmContextEngine implements ContextEngine {
             // Prune HEARTBEAT_OK turns from the freshly imported data
             let prunedMessages = 0;
             if (this.config.pruneHeartbeatOk) {
-              const pruned = await this.pruneHeartbeatOkTurns(conversationId);
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
               prunedMessages = pruned;
               if (pruned > 0) {
                 this.deps.log.info(
@@ -6018,7 +4804,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
           if (pruned > 0) {
             await this.refreshBootstrapState({
               conversationId: conversation.conversationId,
@@ -6054,291 +4840,6 @@ export class LcmContextEngine implements ContextEngine {
     return result;
   }
 
-  /**
-   * Remove messages from the batch that already exist in the DB for this session.
-   * Conservative replay detection: only strip a prefix when the incoming
-   * batch begins with the entire stored transcript for the session.
-   *
-   * Fixes two issues from #246:
-   * 1. Replaced hasMessage() fast-path with aligned-tail check — the old
-   *    approach false-positives on legitimate repeated first messages
-   * 2. Dedup now runs on newMessages only, before autoCompactionSummary
-   *    is prepended — synthetic summaries can no longer interfere with
-   *    replay detection
-   */
-  /**
-   * After a covered transcript reconcile the DB tail IS the transcript
-   * frontier, so the runtime turn delta needs exact alignment, not heuristic
-   * dedup. Three cases:
-   *  - the transcript flushed the whole turn: the batch aligns fully with the
-   *    DB tail — nothing to ingest;
-   *  - the transcript flush lagged mid-turn: a prefix of the batch aligns
-   *    with the DB tail — ingest only the remainder;
-   *  - no tail alignment: a batch with zero persisted-identity overlap is a
-   *    genuinely unflushed new turn (ingest all); any overlap means a stale
-   *    replay snapshot — fail closed, because a covered transcript read will
-   *    deliver anything real on the next turn idempotently.
-   */
-  private async alignRuntimeBatchAgainstCoveredFrontier(
-    sessionId: string,
-    sessionKey: string | undefined,
-    batch: AgentMessage[],
-  ): Promise<AgentMessage[]> {
-    if (batch.length === 0) return batch;
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!conversation) return batch;
-    const conversationId = conversation.conversationId;
-
-    const storedBatch = batch.map((message) => toStoredMessage(message));
-    const tail = await this.conversationStore.getLastMessages(conversationId, batch.length);
-    for (let k = Math.min(tail.length, batch.length); k > 0; k -= 1) {
-      const tailSlice = tail.slice(tail.length - k);
-      let aligned = true;
-      for (let i = 0; i < k; i += 1) {
-        if (
-          messageIdentity(tailSlice[i]!.role, tailSlice[i]!.content) !==
-          messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-        ) {
-          aligned = false;
-          break;
-        }
-      }
-      if (aligned) {
-        return batch.slice(k);
-      }
-    }
-
-    let persistedIdentityOverlaps = 0;
-    for (const stored of storedBatch) {
-      if (await this.conversationStore.hasMessage(conversationId, stored.role, stored.content)) {
-        persistedIdentityOverlaps += 1;
-      }
-    }
-    if (persistedIdentityOverlaps > 0) {
-      this.deps.log.warn(
-        `[lcm] afterTurn: runtime batch does not align with the covered transcript frontier and overlaps persisted history (${persistedIdentityOverlaps}/${batch.length}); failing closed — the transcript reconcile delivers real messages next turn conversation=${conversationId}`,
-      );
-      return [];
-    }
-    return batch;
-  }
-
-  private async deduplicateAfterTurnBatch(
-    sessionId: string,
-    sessionKey: string | undefined,
-    batch: AgentMessage[],
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    if (batch.length === 0) return batch;
-
-    const conversation = await this.conversationStore.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    if (!conversation) return batch;
-
-    const conversationId = conversation.conversationId;
-    const storedMessageCount = await this.conversationStore.getMessageCount(conversationId);
-    if (storedMessageCount === 0) return batch;
-
-    const lastDbMessage = await this.conversationStore.getLastMessage(conversationId);
-    if (!lastDbMessage) return batch;
-
-    const storedBatch = batch.map((m) => toStoredMessage(m));
-
-    // When the DB already has more messages than the incoming batch,
-    // the batch may be a tail-only replay. Try tail-matching first,
-    // then fall back to suffix-matching.
-    if (storedMessageCount > batch.length) {
-      return this.deduplicateOversizedBatch(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        lastDbMessage,
-        options,
-      );
-    }
-
-    // Aligned-tail check: DB's last message must match the message at the
-    // exact replay boundary in the incoming batch. This replaces the
-    // hasMessage() check which could false-positive on any repeated content.
-    const batchAtBoundary = storedBatch[storedMessageCount - 1]!;
-    if (
-      messageIdentity(lastDbMessage.role, lastDbMessage.content) !==
-      messageIdentity(batchAtBoundary.role, batchAtBoundary.content)
-    ) {
-      // Prefix mismatch — attempt suffix fallback before giving up.
-      return this.deduplicateSuffixFallback(
-        conversationId,
-        batch,
-        storedBatch,
-        storedMessageCount,
-        "prefix-mismatch",
-      );
-    }
-
-    // Full proof: incoming batch must start with the entire stored transcript
-    // in exact order before we trim anything.
-    const storedMessages = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (storedMessages.length !== storedMessageCount) {
-      return batch;
-    }
-    for (let i = 0; i < storedMessageCount; i += 1) {
-      const storedConversationMessage = storedMessages[i]!;
-      const incomingMessage = storedBatch[i]!;
-      if (
-        messageIdentity(storedConversationMessage.role, storedConversationMessage.content) !==
-        messageIdentity(incomingMessage.role, incomingMessage.content)
-      ) {
-        return batch;
-      }
-    }
-
-    return batch.slice(storedMessageCount);
-  }
-
-  /**
-   * Handle the case where the DB has more messages than the incoming batch.
-   * The batch is likely a tail-only replay after compaction — try to match
-   * the entire batch against the tail of stored messages.
-   */
-  private async deduplicateOversizedBatch(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    lastDbMessage: { role: string; content: string },
-    options?: { oversizedNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const lastBatchIdentity = messageIdentity(
-      storedBatch[storedBatch.length - 1]!.role,
-      storedBatch[storedBatch.length - 1]!.content,
-    );
-    const lastDbIdentity = messageIdentity(lastDbMessage.role, lastDbMessage.content);
-
-    // Quick check: if the last DB message matches the last batch message,
-    // verify that the entire batch matches the actual DB tail. Message seq
-    // can have gaps after maintenance deletes, so do not derive seq from count.
-    if (lastDbIdentity === lastBatchIdentity) {
-      const storedMessages = await this.conversationStore.getMessages(conversationId, {
-        limit: storedMessageCount,
-      });
-      const tailMessages = storedMessages.slice(-batch.length);
-      if (tailMessages.length === batch.length) {
-        let tailMatch = true;
-        for (let i = 0; i < batch.length; i++) {
-          if (
-            messageIdentity(tailMessages[i]!.role, tailMessages[i]!.content) !==
-            messageIdentity(storedBatch[i]!.role, storedBatch[i]!.content)
-          ) {
-            tailMatch = false;
-            break;
-          }
-        }
-        if (tailMatch) {
-          this.deps.log.debug(
-            `[lcm] dedup: tail-match detected, batch already fully stored ` +
-              `(storedCount=${storedMessageCount} batchLen=${batch.length}), skipping entire batch`,
-          );
-          return [];
-        }
-      }
-    }
-
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
-    return this.deduplicateSuffixFallback(
-      conversationId,
-      batch,
-      storedBatch,
-      storedMessageCount,
-      "oversized",
-      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
-    );
-  }
-
-  /**
-   * Suffix-matching fallback: scan the batch from the end looking for a
-   * boundary where the stored transcript's tail aligns with a suffix of the
-   * batch. Returns only the genuinely new messages after that boundary.
-   */
-  private async deduplicateSuffixFallback(
-    conversationId: number,
-    batch: AgentMessage[],
-    storedBatch: ReturnType<typeof toStoredMessage>[],
-    storedMessageCount: number,
-    context: string,
-    options?: { onNoOverlap?: "ingest" | "skip" },
-  ): Promise<AgentMessage[]> {
-    const allStored = await this.conversationStore.getMessages(conversationId, {
-      limit: storedMessageCount,
-    });
-    if (allStored.length === 0) return batch;
-
-    const lastStoredIdentity = messageIdentity(
-      allStored[allStored.length - 1]!.role,
-      allStored[allStored.length - 1]!.content,
-    );
-
-    for (let k = batch.length - 1; k >= 0; k--) {
-      if (
-        messageIdentity(storedBatch[k]!.role, storedBatch[k]!.content) !== lastStoredIdentity
-      ) {
-        continue;
-      }
-      const matchLen = Math.min(k + 1, allStored.length);
-      const startDb = allStored.length - matchLen;
-      let suffixMatch = true;
-      for (let j = 0; j < matchLen; j++) {
-        if (
-          messageIdentity(
-            allStored[startDb + j]!.role,
-            allStored[startDb + j]!.content,
-          ) !==
-          messageIdentity(
-            storedBatch[k - matchLen + 1 + j]!.role,
-            storedBatch[k - matchLen + 1 + j]!.content,
-          )
-        ) {
-          suffixMatch = false;
-          break;
-        }
-      }
-      const newSlice = batch.slice(k + 1);
-      if (suffixMatch && (newSlice.length > 0 || matchLen > 1)) {
-        this.deps.log.debug(
-          `[lcm] dedup: ${context} suffix-match at batch[${k}], ` +
-            `returning ${newSlice.length} new messages ` +
-            `(storedCount=${storedMessageCount} batchLen=${batch.length})`,
-        );
-        return newSlice;
-      }
-    }
-
-    if (options?.onNoOverlap === "skip") {
-      this.deps.log.warn(
-        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-          `no overlap found — fail-closed skipping full batch`,
-      );
-      return [];
-    }
-
-    this.deps.log.warn(
-      `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
-        `no overlap found — ingesting full batch`,
-    );
-    return batch;
-  }
   /**
    * Rebuild a compact tool-result message from stored message parts.
    *
@@ -6666,7 +5167,7 @@ export class LcmContextEngine implements ContextEngine {
 
     let messageForParts = message;
 
-    const nativeImageIntercepted = await this.interceptNativeImageBlocks({
+    const nativeImageIntercepted = await this.largeFileInterceptor.interceptNativeImageBlocks({
       conversationId,
       message: messageForParts,
     });
@@ -6676,7 +5177,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (stored.role === "tool") {
-      const imageIntercepted = await this.interceptInlineImagesInToolMessage({
+      const imageIntercepted = await this.largeFileInterceptor.interceptInlineImagesInToolMessage({
         conversationId,
         message: messageForParts,
       });
@@ -6685,7 +5186,7 @@ export class LcmContextEngine implements ContextEngine {
         stored = toStoredMessage(messageForParts);
       }
     } else {
-      const imageIntercepted = await this.interceptInlineImages({
+      const imageIntercepted = await this.largeFileInterceptor.interceptInlineImages({
         conversationId,
         content: stored.content,
         role: stored.role,
@@ -6703,7 +5204,7 @@ export class LcmContextEngine implements ContextEngine {
     }
 
     if (stored.role === "user") {
-      const intercepted = await this.interceptLargeFiles({
+      const intercepted = await this.largeFileInterceptor.interceptLargeFiles({
         conversationId,
         content: stored.content,
       });
@@ -6718,7 +5219,7 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
     } else if (stored.role === "tool") {
-      const intercepted = await this.interceptLargeToolResults({
+      const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
         conversationId,
         message: messageForParts,
       });
@@ -6730,7 +5231,7 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    const rawPayloadIntercepted = await this.interceptLargeRawPayload({
+    const rawPayloadIntercepted = await this.largeFileInterceptor.interceptLargeRawPayload({
       conversationId,
       message: messageForParts,
       stored,
@@ -6945,7 +5446,7 @@ export class LcmContextEngine implements ContextEngine {
       // tail is exact — use precise alignment instead of the heuristic
       // dedup stack, and persist only what the transcript flush has not
       // delivered yet.
-      dedupedNewMessages = await this.alignRuntimeBatchAgainstCoveredFrontier(
+      dedupedNewMessages = await this.batchDeduplicator.alignRuntimeBatchAgainstCoveredFrontier(
         params.sessionId,
         params.sessionKey,
         newMessages,
@@ -6956,7 +5457,7 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     } else {
-      dedupedNewMessages = await this.deduplicateAfterTurnBatch(
+      dedupedNewMessages = await this.batchDeduplicator.deduplicateAfterTurnBatch(
         params.sessionId,
         params.sessionKey,
         newMessages,
@@ -7045,7 +5546,7 @@ export class LcmContextEngine implements ContextEngine {
           sessionKey: params.sessionKey,
         });
         if (conversation) {
-          const pruned = await this.pruneHeartbeatOkTurns(conversation.conversationId);
+          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
           if (pruned > 0) {
             const sessionContext = this.formatSessionLogContext({
               conversationId: conversation.conversationId,
@@ -7427,7 +5928,7 @@ export class LcmContextEngine implements ContextEngine {
         let interceptedAny = false;
         for (let i = 0; i < liveMessages.length; i++) {
           const message = liveMessages[i]!;
-          const intercepted = await this.interceptLargeToolResults({
+          const intercepted = await this.largeFileInterceptor.interceptLargeToolResults({
             conversationId: conversation.conversationId,
             message,
             getFileId: ({ content, toolName, callId }) =>
@@ -9246,7 +7747,7 @@ export class LcmContextEngine implements ContextEngine {
       }),
       breakerScope: this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
     });
-    if (breakerKey && this.isCircuitBreakerOpen(breakerKey)) {
+    if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
         kind: "unavailable",
         reason: "Lossless Claw could not summarize raw context before rotate because the summary provider circuit breaker is open.",
@@ -9279,7 +7780,7 @@ export class LcmContextEngine implements ContextEngine {
       if (!result.actionTaken) {
         if (result.authFailure) {
           if (breakerKey) {
-            this.recordCompactionAuthFailure(breakerKey);
+            this.compactionGuards.recordCompactionAuthFailure(breakerKey);
           }
           return {
             kind: "unavailable",
@@ -9294,7 +7795,7 @@ export class LcmContextEngine implements ContextEngine {
         return { kind: "ready", conversationId: current.conversationId, leafPasses };
       }
       if (breakerKey) {
-        this.recordCompactionSuccess(breakerKey);
+        this.compactionGuards.recordCompactionSuccess(breakerKey);
       }
       leafPasses += 1;
     }
@@ -9690,70 +8191,6 @@ export class LcmContextEngine implements ContextEngine {
     return this.compactionMaintenanceStore;
   }
 
-  // ── Heartbeat pruning ──────────────────────────────────────────────────
-
-  /**
-   * Detect HEARTBEAT_OK turn cycles in a conversation and delete them.
-   *
-   * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
-   * any tool call/result messages, ending with an assistant message that is a
-   * heartbeat ack. The entire sequence has no durable information value for LCM.
-   *
-   * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
-   * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
-   * This catches both exact "HEARTBEAT_OK" and chatty variants like
-   * "HEARTBEAT_OK — weekend, no market".
-   *
-   * Returns the number of messages deleted.
-   */
-  private async pruneHeartbeatOkTurns(conversationId: number): Promise<number> {
-    const allMessages = await this.conversationStore.getMessages(conversationId);
-    if (allMessages.length === 0) {
-      return 0;
-    }
-
-    const toDelete: number[] = [];
-
-    // Walk through messages finding HEARTBEAT_OK assistant replies, then
-    // collect the entire turn (back to the preceding user message).
-    for (let i = 0; i < allMessages.length; i++) {
-      const msg = allMessages[i];
-      if (msg.role !== "assistant") {
-        continue;
-      }
-      if (!isHeartbeatOkContent(msg.content)) {
-        continue;
-      }
-
-      // Found an exact HEARTBEAT_OK reply. Walk backward to find the turn start
-      // (the preceding user message).
-      const turnMessages = [msg];
-      for (let j = i - 1; j >= 0; j--) {
-        const prev = allMessages[j];
-        turnMessages.push(prev);
-        if (prev.role === "user") {
-          break; // Found turn start
-        }
-      }
-
-      if (!turnMessages.some((record) => record.role === "user")) {
-        continue;
-      }
-      if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
-        continue;
-      }
-
-      toDelete.push(...turnMessages.map((record) => record.messageId));
-    }
-
-    if (toDelete.length === 0) {
-      return 0;
-    }
-
-    // Deduplicate (a message could theoretically appear in multiple turns)
-    const uniqueIds = [...new Set(toDelete)];
-    return this.conversationStore.deleteMessages(uniqueIds);
-  }
 }
 
 // ── Heartbeat detection ─────────────────────────────────────────────────────

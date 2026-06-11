@@ -2483,12 +2483,14 @@ describe("LcmContextEngine fidelity and token budget", () => {
       compaction: {
         evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
       };
-      deduplicateAfterTurnBatch: (
-        sessionId: string,
-        sessionKey: string | undefined,
-        messages: AgentMessage[],
-        opts: unknown,
-      ) => Promise<AgentMessage[]>;
+      batchDeduplicator: {
+        deduplicateAfterTurnBatch: (
+          sessionId: string,
+          sessionKey: string | undefined,
+          messages: AgentMessage[],
+          opts: unknown,
+        ) => Promise<AgentMessage[]>;
+      };
       scheduleDeferredCompactionDebtDrain: (params: unknown) => void;
     };
 
@@ -2496,7 +2498,7 @@ describe("LcmContextEngine fidelity and token budget", () => {
       sessionId,
       message: makeMessage({ role: "user", content: "seed message" }),
     });
-    vi.spyOn(privateEngine, "deduplicateAfterTurnBatch").mockResolvedValue([]);
+    vi.spyOn(privateEngine.batchDeduplicator, "deduplicateAfterTurnBatch").mockResolvedValue([]);
     vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
       shouldCompact: true,
       reason: "threshold",
@@ -2536,19 +2538,21 @@ describe("LcmContextEngine fidelity and token budget", () => {
       compaction: {
         evaluate: (conversationId: number, tokenBudget: number, observed?: number) => Promise<unknown>;
       };
-      deduplicateAfterTurnBatch: (
-        sessionId: string,
-        sessionKey: string | undefined,
-        messages: AgentMessage[],
-        opts: unknown,
-      ) => Promise<AgentMessage[]>;
+      batchDeduplicator: {
+        deduplicateAfterTurnBatch: (
+          sessionId: string,
+          sessionKey: string | undefined,
+          messages: AgentMessage[],
+          opts: unknown,
+        ) => Promise<AgentMessage[]>;
+      };
     };
 
     await engine.ingest({
       sessionId,
       message: makeMessage({ role: "user", content: "seed message" }),
     });
-    vi.spyOn(privateEngine, "deduplicateAfterTurnBatch").mockResolvedValue([]);
+    vi.spyOn(privateEngine.batchDeduplicator, "deduplicateAfterTurnBatch").mockResolvedValue([]);
     vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
       shouldCompact: false,
       reason: "below threshold",
