@@ -14,7 +14,7 @@ import type { LcmConfig } from "./db/config.js";
 import type { AgentMessage, IngestResult } from "./openclaw-bridge.js";
 import type { TranscriptReconcileResult } from "./reconcile-plan.js";
 import { SessionRolloverDetector } from "./session-rollover.js";
-import type { ConversationStore } from "./store/conversation-store.js";
+import type { ConversationRecord, ConversationStore } from "./store/conversation-store.js";
 import type { SummaryStore } from "./store/summary-store.js";
 import type { LcmDependencies } from "./types.js";
 import { readFileSync } from "node:fs";
@@ -626,190 +626,16 @@ export class TranscriptReconciler {
 
       if (anchorIndex < 0) {
         if (params.allowNoAnchorImport) {
-          if (
-            (params.noAnchorImportReason === "path-mismatch" ||
-              params.noAnchorImportReason === "checkpoint-missing-recovery") &&
-            isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
-          ) {
-            this.host.deps.log.warn(
-              `[lcm] reconcileSessionTail: blocked delivery-only path-mismatched transcript for ${sessionContext}; preserving existing checkpoint because the rotated transcript contains only injected delivery/config traffic`,
-            );
-            this.host.deps.log.debug(
-              `[lcm] reconcileSessionTail: blocked delivery-only path mismatch for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} overlap=false`,
-            );
-            return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
-          }
-
-          const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+          return this.importNoAnchorEpoch({
+            sessionId,
+            sessionKey: params.sessionKey,
             conversationId,
-            messages: historicalMessages,
-          });
-          const persistedIdentityOverlaps = replayAnalysis.overlaps;
-          let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
-            messages: historicalMessages,
+            historicalMessages,
+            noAnchorImportReason: params.noAnchorImportReason,
+            existingDbCount,
             sessionContext,
-            source: "reconcileSessionTail no-anchor",
+            startedAt,
           });
-          // A fully id-bearing batch resolves identity overlaps exactly:
-          // identity matches adopt the re-issued entry id (host rewrites and
-          // rotations re-append the surviving suffix under new ids) and only
-          // genuinely-new entries import. The replay-overlap block below
-          // exists for id-less ambiguity, where overlap could equally mean a
-          // replayed file; applying it here would freeze rewritten-epoch
-          // transcripts instead of healing them.
-          const allEntryIdBearing =
-            noAnchorImportMessages.length > 0 &&
-            noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
-          const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
-          if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
-            if (replayAnalysis.firstNonOverlappingIndex < 0) {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "duplicate-transcript-replay",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-
-            if (replayAnalysis.firstNonOverlappingIndex > 0) {
-              noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
-                messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
-                sessionContext,
-                source: "reconcileSessionTail no-anchor replay-prefix",
-              });
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
-              );
-            }
-          }
-
-          const importCap = transcriptImportCap(existingDbCount);
-          let noAnchorImportCapped = false;
-          if (noAnchorImportMessages.length > importCap) {
-            if (allEntryIdBearing) {
-              // A fully id-bearing new epoch is exact (every entry adopts or
-              // imports by verified id), so a large rollover — e.g. a host
-              // rewrite or compaction successor with a kept tail beyond the
-              // cap — drains in bounded oldest-first chunks instead of
-              // freezing before adoption can heal it. After the first chunk
-              // persists ids, the entry-id anchor takes over on later passes.
-              noAnchorImportCapped = true;
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: no-anchor entry-id import cap chunking for ${sessionContext} — importing ${importCap}/${noAnchorImportMessages.length} new-epoch messages this pass (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}); remaining backlog continues next pass`,
-              );
-              noAnchorImportMessages = noAnchorImportMessages.slice(0, importCap);
-            } else {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "import-cap",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-          }
-
-          if (params.noAnchorImportReason === "same-path-shrink") {
-            const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
-              conversationId,
-              sessionId,
-              messages: noAnchorImportMessages,
-            });
-            if (rawIdMatches.matchedRawIds > 0) {
-              this.host.deps.log.warn(
-                `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
-              );
-              this.host.deps.log.debug(
-                `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
-              );
-              return {
-                blockedByImportCap: true,
-                blockedReason: "cross-conversation-raw-id",
-                importedMessages: 0,
-                hasOverlap: false,
-              };
-            }
-          }
-
-          // Ids on the current leaf path, for stale-id re-stamping of rows
-          // stranded by the rewrite/rotation that produced this new epoch.
-          const noAnchorLeafEntryIds = new Set(
-            historicalMessages
-              .map((message) => getTranscriptEntryId(message))
-              .filter((id): id is string => id !== null),
-          );
-          let importedMessages = 0;
-          let adoptedMessages = 0;
-          for (const message of noAnchorImportMessages) {
-            const entryId = getTranscriptEntryId(message);
-            if (entryId) {
-              const alreadyPersisted = await this.host.conversationStore.hasMessageByTranscriptEntryId(
-                conversationId,
-                entryId,
-              );
-              if (alreadyPersisted) {
-                continue;
-              }
-              const stored = toStoredMessage(message);
-              const adopted =
-                (await this.host.conversationStore.adoptTranscriptEntryId(
-                  conversationId,
-                  stored.role,
-                  stored.content,
-                  entryId,
-                )) ||
-                (await this.adoptStaleTranscriptEntryId({
-                  conversationId,
-                  leafEntryIds: noAnchorLeafEntryIds,
-                  role: stored.role,
-                  content: stored.content,
-                  entryId,
-                }));
-              if (adopted) {
-                adoptedMessages += 1;
-                continue;
-              }
-            }
-            const result = await this.host.ingestSingle({
-              sessionId,
-              sessionKey: params.sessionKey,
-              message,
-              skipReplayTimestampFloodGuard: true,
-            });
-            if (result.ingested) {
-              importedMessages += 1;
-            }
-          }
-          this.host.deps.log.warn(
-            `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`,
-          );
-          if (noAnchorImportCapped) {
-            // Partial pass: keep the checkpoint un-advanced so the next pass
-            // continues the drain (via the entry-id anchor once this chunk's
-            // ids are persisted).
-            return {
-              blockedByImportCap: true,
-              blockedReason: "import-cap",
-              importedMessages,
-              hasOverlap: adoptedMessages > 0,
-            };
-          }
-          // Adoption proves the "new epoch" overlaps persisted history (the
-          // host re-issued ids for messages we already hold), so report the
-          // overlap — the caller then refreshes the checkpoint instead of
-          // re-entering this path every turn.
-          return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
         }
         this.host.deps.log.debug(
           `[lcm] reconcileSessionTail: no anchor for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} importedMessages=0 overlap=false`,
@@ -854,19 +680,12 @@ export class TranscriptReconciler {
       );
     }
 
-    let importedMessages = 0;
-    for (const [index, message] of importableTail.entries()) {
-      const result = await this.host.ingestSingle({
-        sessionId,
-        sessionKey: params.sessionKey,
-        message,
-        skipReplayTimestampFloodGuard:
-          index < missingTailFiltered.replayGuardExemptPrefixLength,
-      });
-      if (result.ingested) {
-        importedMessages += 1;
-      }
-    }
+    const importedMessages = await this.ingestBatch({
+      sessionId,
+      sessionKey: params.sessionKey,
+      messages: importableTail,
+      replayGuardExemptPrefixLength: missingTailFiltered.replayGuardExemptPrefixLength,
+    });
 
     if (importCapped) {
       this.host.deps.log.debug(
@@ -884,6 +703,215 @@ export class TranscriptReconciler {
       `[lcm] reconcileSessionTail: slow path for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} anchorIndex=${anchorIndex} missingTail=${missingTail.length} importedMessages=${importedMessages}`,
     );
     return { blockedByImportCap: false, importedMessages, hasOverlap: true };
+  }
+
+  /**
+   * No-anchor recovery: the transcript shares no anchor with persisted
+   * history, but the caller has lineage evidence (path mismatch, declared
+   * epoch rollover, same-path shrink, checkpoint recovery) that this file is
+   * still this conversation's continuation. Import it as a bounded new
+   * epoch: delivery-only and replay-flood transcripts are blocked, the
+   * import cap chunks oversized batches (entry-id-bearing epochs drain
+   * oldest-first), and identity matches adopt re-issued entry ids instead of
+   * duplicating rows.
+   */
+  private async importNoAnchorEpoch(params: {
+    sessionId: string;
+    sessionKey?: string;
+    conversationId: number;
+    historicalMessages: AgentMessage[];
+    noAnchorImportReason?: string;
+    existingDbCount: number;
+    sessionContext: string;
+    startedAt: number;
+  }): Promise<TranscriptReconcileResult> {
+    const { sessionId, conversationId, historicalMessages, existingDbCount } = params;
+    const { startedAt, sessionContext } = params;
+
+    if (
+      (params.noAnchorImportReason === "path-mismatch" ||
+        params.noAnchorImportReason === "checkpoint-missing-recovery") &&
+      isLikelyInjectedDeliveryOnlyTranscript(historicalMessages)
+    ) {
+      this.host.deps.log.warn(
+        `[lcm] reconcileSessionTail: blocked delivery-only path-mismatched transcript for ${sessionContext}; preserving existing checkpoint because the rotated transcript contains only injected delivery/config traffic`,
+      );
+      this.host.deps.log.debug(
+        `[lcm] reconcileSessionTail: blocked delivery-only path mismatch for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} overlap=false`,
+      );
+      return { blockedByImportCap: false, importedMessages: 0, hasOverlap: false };
+    }
+
+    const replayAnalysis = await this.analyzePersistedTranscriptIdentityOverlaps({
+      conversationId,
+      messages: historicalMessages,
+    });
+    const persistedIdentityOverlaps = replayAnalysis.overlaps;
+    let noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+      messages: historicalMessages,
+      sessionContext,
+      source: "reconcileSessionTail no-anchor",
+    });
+    // A fully id-bearing batch resolves identity overlaps exactly:
+    // identity matches adopt the re-issued entry id (host rewrites and
+    // rotations re-append the surviving suffix under new ids) and only
+    // genuinely-new entries import. The replay-overlap block below
+    // exists for id-less ambiguity, where overlap could equally mean a
+    // replayed file; applying it here would freeze rewritten-epoch
+    // transcripts instead of healing them.
+    const allEntryIdBearing =
+      noAnchorImportMessages.length > 0 &&
+      noAnchorImportMessages.every((message) => getTranscriptEntryId(message) !== null);
+    const replayThreshold = Math.max(3, Math.ceil(historicalMessages.length * 0.5));
+    if (!allEntryIdBearing && persistedIdentityOverlaps >= replayThreshold) {
+      if (replayAnalysis.firstNonOverlappingIndex < 0) {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: duplicate transcript replay blocked for ${sessionContext} - ${persistedIdentityOverlaps}/${historicalMessages.length} candidate messages already exist (reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent replay flood.`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked duplicate transcript replay for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} persistedIdentityOverlaps=${persistedIdentityOverlaps} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "duplicate-transcript-replay",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+
+      if (replayAnalysis.firstNonOverlappingIndex > 0) {
+        noAnchorImportMessages = this.filterSyntheticHeartbeatTranscriptMessages({
+          messages: historicalMessages.slice(replayAnalysis.firstNonOverlappingIndex),
+          sessionContext,
+          source: "reconcileSessionTail no-anchor replay-prefix",
+        });
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: duplicate transcript replay guard dropped ${replayAnalysis.firstNonOverlappingIndex}/${historicalMessages.length} already-persisted prefix messages for ${sessionContext} before no-anchor import (reason: ${params.noAnchorImportReason ?? "unspecified"})`,
+        );
+      }
+    }
+
+    const importCap = transcriptImportCap(existingDbCount);
+    let noAnchorImportCapped = false;
+    if (noAnchorImportMessages.length > importCap) {
+      if (allEntryIdBearing) {
+        // A fully id-bearing new epoch is exact (every entry adopts or
+        // imports by verified id), so a large rollover — e.g. a host
+        // rewrite or compaction successor with a kept tail beyond the
+        // cap — drains in bounded oldest-first chunks instead of
+        // freezing before adoption can heal it. After the first chunk
+        // persists ids, the entry-id anchor takes over on later passes.
+        noAnchorImportCapped = true;
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: no-anchor entry-id import cap chunking for ${sessionContext} — importing ${importCap}/${noAnchorImportMessages.length} new-epoch messages this pass (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}); remaining backlog continues next pass`,
+        );
+        noAnchorImportMessages = noAnchorImportMessages.slice(0, importCap);
+      } else {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: no anchor import cap exceeded for ${sessionContext} - would import ${noAnchorImportMessages.length} messages (existing: ${existingDbCount}, cap: ${importCap}, reason: ${params.noAnchorImportReason ?? "unspecified"}). Aborting to prevent flood.`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked no-anchor import for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} existingDbCount=${existingDbCount} cap=${importCap} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "import-cap",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+    }
+
+    if (params.noAnchorImportReason === "same-path-shrink") {
+      const rawIdMatches = this.countActiveCrossConversationRawIdMatches({
+        conversationId,
+        sessionId,
+        messages: noAnchorImportMessages,
+      });
+      if (rawIdMatches.matchedRawIds > 0) {
+        this.host.deps.log.warn(
+          `[lcm] reconcileSessionTail: blocked same-path-shrink no-anchor import for ${sessionContext} because ${rawIdMatches.matchedRawIds}/${rawIdMatches.candidateRawIds} candidate raw ids already exist in other active conversations`,
+        );
+        this.host.deps.log.debug(
+          `[lcm] reconcileSessionTail: blocked cross-conversation raw-id duplicate for ${sessionContext} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateRawIds=${rawIdMatches.candidateRawIds} matchedRawIds=${rawIdMatches.matchedRawIds} overlap=false`,
+        );
+        return {
+          blockedByImportCap: true,
+          blockedReason: "cross-conversation-raw-id",
+          importedMessages: 0,
+          hasOverlap: false,
+        };
+      }
+    }
+
+    // Ids on the current leaf path, for stale-id re-stamping of rows
+    // stranded by the rewrite/rotation that produced this new epoch.
+    const noAnchorLeafEntryIds = new Set(
+      historicalMessages
+        .map((message) => getTranscriptEntryId(message))
+        .filter((id): id is string => id !== null),
+    );
+    let importedMessages = 0;
+    let adoptedMessages = 0;
+    for (const message of noAnchorImportMessages) {
+      const entryId = getTranscriptEntryId(message);
+      if (entryId) {
+        const alreadyPersisted = await this.host.conversationStore.hasMessageByTranscriptEntryId(
+          conversationId,
+          entryId,
+        );
+        if (alreadyPersisted) {
+          continue;
+        }
+        const stored = toStoredMessage(message);
+        const adopted =
+          (await this.host.conversationStore.adoptTranscriptEntryId(
+            conversationId,
+            stored.role,
+            stored.content,
+            entryId,
+          )) ||
+          (await this.adoptStaleTranscriptEntryId({
+            conversationId,
+            leafEntryIds: noAnchorLeafEntryIds,
+            role: stored.role,
+            content: stored.content,
+            entryId,
+          }));
+        if (adopted) {
+          adoptedMessages += 1;
+          continue;
+        }
+      }
+      const result = await this.host.ingestSingle({
+        sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard: true,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+    this.host.deps.log.warn(
+      `[lcm] reconcileSessionTail: no anchor for ${sessionContext}; imported transcript as new epoch reason=${params.noAnchorImportReason ?? "unspecified"} duration=${formatDurationMs(Date.now() - startedAt)} historicalMessages=${historicalMessages.length} candidateMessages=${noAnchorImportMessages.length} importedMessages=${importedMessages} adoptedMessages=${adoptedMessages} capped=${noAnchorImportCapped} overlap=${adoptedMessages > 0}`,
+    );
+    if (noAnchorImportCapped) {
+      // Partial pass: keep the checkpoint un-advanced so the next pass
+      // continues the drain (via the entry-id anchor once this chunk's
+      // ids are persisted).
+      return {
+        blockedByImportCap: true,
+        blockedReason: "import-cap",
+        importedMessages,
+        hasOverlap: adoptedMessages > 0,
+      };
+    }
+    // Adoption proves the "new epoch" overlaps persisted history (the
+    // host re-issued ids for messages we already hold), so report the
+    // overlap — the caller then refreshes the checkpoint instead of
+    // re-entering this path every turn.
+    return { blockedByImportCap: false, importedMessages, hasOverlap: adoptedMessages > 0 };
   }
 
   /** Count candidate raw event IDs that already belong to another active conversation. */
@@ -1378,6 +1406,618 @@ export class TranscriptReconciler {
     };
   }
 
+  /**
+   * Ingest a reconciled batch in order, returning how many rows persisted.
+   * Indexes below `replayGuardExemptPrefixLength` skip the replay-timestamp
+   * flood guard (transcript-proven history); pass Infinity to exempt all.
+   */
+  private async ingestBatch(params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    replayGuardExemptPrefixLength: number;
+  }): Promise<number> {
+    let importedMessages = 0;
+    for (const [index, message] of params.messages.entries()) {
+      const result = await this.host.ingestSingle({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        message,
+        skipReplayTimestampFloodGuard: index < params.replayGuardExemptPrefixLength,
+      });
+      if (result.ingested) {
+        importedMessages += 1;
+      }
+    }
+    return importedMessages;
+  }
+
+  /**
+   * Record a successful reconcile import and refresh the bootstrap
+   * checkpoint to the transcript frontier. No-op when nothing imported.
+   */
+  private async recordImportAndRefreshCheckpoint(params: {
+    conversationId: number;
+    sessionFile: string;
+    importedMessages: number;
+  }): Promise<void> {
+    if (params.importedMessages <= 0) {
+      return;
+    }
+    this.host.recordRecentBootstrapImport(
+      params.conversationId,
+      params.importedMessages,
+      "reconciled missing session messages",
+    );
+    await this.refreshBootstrapState({
+      conversationId: params.conversationId,
+      sessionFile: params.sessionFile,
+    });
+  }
+
+  /**
+   * Seed an offset-0 placeholder bootstrap_state row so the next turn can
+   * recover via the incremental path. Used only when no checkpoint exists;
+   * failures are logged and swallowed (the slow path retries later).
+   */
+  private async seedPlaceholderBootstrapState(params: {
+    conversationId: number;
+    sessionFile: string;
+  }): Promise<void> {
+    try {
+      await this.host.summaryStore.upsertConversationBootstrapState({
+        conversationId: params.conversationId,
+        sessionFilePath: params.sessionFile,
+        lastSeenSize: 0,
+        lastSeenMtimeMs: 0,
+        lastProcessedOffset: 0,
+        lastProcessedEntryHash: null,
+      });
+    } catch (seedError) {
+      this.host.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${params.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
+      );
+    }
+  }
+
+  /**
+   * First-contact import: no persisted conversation exists for this session
+   * yet, so the transcript (not the runtime delta) seeds it — foreground
+   * prompts can be omitted from afterTurn's messages array. Bounded by the
+   * bootstrap budget; heartbeat-ack turns defer to the runtime batch path,
+   * which owns conversation creation and heartbeat pruning.
+   */
+  private async importInitialAfterTurnTranscript(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    isHeartbeat?: boolean;
+  }): Promise<TranscriptReconcileResult> {
+      if (params.isHeartbeat) {
+        return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+      }
+      // No persisted conversation exists yet. Prefer the transcript over
+      // the runtime delta so foreground prompts that are omitted from
+      // afterTurn's messages array are not lost.
+      let sessionFileState: { size: number } | undefined;
+      try {
+        const sessionFileStats = await stat(params.sessionFile);
+        sessionFileState = { size: sessionFileStats.size };
+      } catch {
+        // Missing files are common for brand-new live sessions; allow the
+        // runtime batch to seed the conversation in that case.
+      }
+      const historicalMessages = await readLeafPathMessages(params.sessionFile);
+      if (historicalMessages.length === 0) {
+        if ((sessionFileState?.size ?? 0) > 0) {
+          this.host.deps.log.warn(
+            `[lcm] afterTurn: initial transcript read returned no messages from non-empty file; skipping live afterTurn persistence to avoid anchoring past unreadable history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile}`,
+          );
+          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
+        }
+        return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+      }
+      if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
+        // Not covered: the runtime batch path owns conversation creation
+        // and heartbeat-ack pruning for brand-new sessions.
+        return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
+      }
+      const bootstrapMessages = trimBootstrapMessagesToBudget(
+        historicalMessages,
+        resolveBootstrapMaxTokens(this.host.config),
+      );
+      if (bootstrapMessages.length === 0) {
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: initial transcript import exceeded bootstrap budget; skipping live afterTurn persistence to avoid anchoring past unreconciled history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile} sourceMessages=${historicalMessages.length}`,
+        );
+        return { importedMessages: 0, blockedByImportCap: true, hasOverlap: false };
+      }
+      const importedMessages = await this.ingestBatch({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        messages: bootstrapMessages,
+        replayGuardExemptPrefixLength: Number.POSITIVE_INFINITY,
+      });
+      if (importedMessages > 0) {
+        const activeConversation = await this.host.conversationStore.getConversationForSession({
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        if (activeConversation) {
+          this.host.recordRecentBootstrapImport(
+            activeConversation.conversationId,
+            importedMessages,
+            "imported initial afterTurn transcript",
+          );
+          await this.refreshBootstrapState({
+            conversationId: activeConversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
+        }
+      }
+      return {
+        importedMessages,
+        blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
+        hasOverlap: true,
+        transcriptCovered: true,
+      };
+  }
+
+  /**
+   * Append-only fast path: when the checkpoint matches this transcript file
+   * and the file only grew, judge just the appended slice. Returns the
+   * reconcile result when the append-only read fully covered the turn, or
+   * null when the slice is ineligible (overlap with persisted rows, suffix
+   * rewrite, shrink) and the caller must fall back to a full re-read.
+   */
+  private async tryAppendOnlyReconcile(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    isHeartbeat?: boolean;
+    conversation: ConversationRecord;
+    checkpoint: Awaited<ReturnType<SummaryStore["getConversationBootstrapState"]>>;
+    transcriptEpochShrank: boolean;
+  }): Promise<TranscriptReconcileResult | null> {
+    const { conversation, checkpoint, transcriptEpochShrank } = params;
+    if (
+      checkpoint &&
+      checkpoint.sessionFilePath === params.sessionFile &&
+      checkpoint.lastProcessedOffset >= 0 &&
+      !transcriptEpochShrank
+    ) {
+      const appended = await readAppendedLeafPathMessages({
+        sessionFile: params.sessionFile,
+        offset: checkpoint.lastProcessedOffset,
+      });
+      if (appended.canUseAppendOnly) {
+        const placeholderCheckpoint =
+          checkpoint.lastSeenSize === 0 &&
+          checkpoint.lastSeenMtimeMs === 0 &&
+          checkpoint.lastProcessedOffset === 0 &&
+          checkpoint.lastProcessedEntryHash === null;
+        if (params.isHeartbeat) {
+          if (!placeholderCheckpoint) {
+            await this.refreshBootstrapState({
+              conversationId: conversation.conversationId,
+              sessionFile: params.sessionFile,
+            });
+            this.host.deps.log.debug(
+              `[lcm] afterTurn: skipped heartbeat transcript append-only delta and refreshed checkpoint conversation=${conversation.conversationId} sessionFile=${params.sessionFile} appendedMessages=${appended.messages.length}`,
+            );
+          }
+          // Heartbeat turns are never persisted; the append-only delta is
+          // intentionally skipped, so the transcript counts as covered.
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            hasOverlap: true,
+            transcriptCovered: true,
+          };
+        }
+        if (placeholderCheckpoint && appended.messages.length > 0) {
+          const reconcile = await this.reconcileSessionTail({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            conversationId: conversation.conversationId,
+            historicalMessages: appended.messages,
+            noAnchorImportReason: "placeholder-checkpoint-recovery",
+          });
+          await this.recordImportAndRefreshCheckpoint({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+            importedMessages: reconcile.importedMessages,
+          });
+          return {
+            ...reconcile,
+            transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
+          };
+        }
+
+        const appendOnlySessionContext = this.host.formatSessionLogContext({
+          conversationId: conversation.conversationId,
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+        });
+        const replayFiltered = await this.filterBootstrapReplayMessages({
+          messages: appended.messages,
+          sessionContext: appendOnlySessionContext,
+          source: "afterTurn transcript reconcile append-only",
+          sessionFile: params.sessionFile,
+        });
+        const replayFilteredMessages = replayFiltered.messages;
+        const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
+          conversationId: conversation.conversationId,
+          messages: replayFilteredMessages,
+          unfilteredMessages: appended.messages,
+          sessionContext: appendOnlySessionContext,
+          source: "afterTurn transcript reconcile append-only",
+        });
+        if (!appendOnlyOverlapsPersisted) {
+          const importedMessages = await this.ingestBatch({
+            sessionId: params.sessionId,
+            sessionKey: params.sessionKey,
+            messages: replayFilteredMessages,
+            replayGuardExemptPrefixLength: replayFiltered.replayGuardExemptPrefixLength,
+          });
+          await this.recordImportAndRefreshCheckpoint({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+            importedMessages,
+          });
+          return {
+            importedMessages,
+            blockedByImportCap: false,
+            hasOverlap: true,
+            transcriptCovered: true,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Full re-read slow path: the checkpoint is missing, path-mismatched,
+   * shrunk, or append-only-ineligible. Re-reads the whole transcript, runs
+   * ambiguous-rollover tier-2 checks on path mismatches, decides whether a
+   * no-anchor epoch import is permitted (declared epoch rollover, shrink,
+   * checkpoint recovery), delegates to reconcileSessionTail, and refreshes
+   * the checkpoint only when the read proved coverage. Unchanged file states
+   * are memoized per process so stale checkpoints do not force a full
+   * O(file-size) read on every turn.
+   */
+  private async fullReadAfterTurnReconcile(params: {
+    sessionId: string;
+    sessionKey?: string;
+    sessionFile: string;
+    allowNoAnchorImportOnCheckpointMissing?: boolean;
+    queueKey: string;
+    conversation: ConversationRecord;
+    checkpoint: Awaited<ReturnType<SummaryStore["getConversationBootstrapState"]>>;
+    sessionFileState: { size: number; mtimeMs: number } | undefined;
+    sessionFileStatError: unknown;
+    transcriptEpochShrank: boolean;
+  }): Promise<TranscriptReconcileResult> {
+    const {
+      queueKey,
+      conversation,
+      checkpoint,
+      sessionFileState,
+      sessionFileStatError,
+      transcriptEpochShrank,
+    } = params;
+    // Slow path: checkpoint missing, path mismatched, or non-append-only.
+    // Cap full re-reads only for unchanged file states. If the transcript
+    // changed since the last full read, reconcile again; if it did not,
+    // skip without advancing the checkpoint so stale state can be retried
+    // after a later file change, process restart, or cap eviction.
+    const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
+    const reason = !checkpoint
+      ? "checkpoint-missing"
+      : checkpoint.sessionFilePath !== params.sessionFile
+        ? "path-mismatch"
+        : transcriptEpochShrank
+          ? "same-path-shrink"
+          : "append-only-ineligible";
+    if (reason === "same-path-shrink") {
+      this.afterTurnReconcileFullReadStates.delete(fullReadKey);
+    }
+    const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
+    if (
+      rememberedFileState
+      && sessionFileState
+      && rememberedFileState.size === sessionFileState.size
+      && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
+    ) {
+      this.host.deps.log.debug(
+        `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+      );
+      // The memo is only populated after a successful covered full read,
+      // and the file has not changed since — still covered.
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: true,
+        transcriptCovered: true,
+      };
+    }
+
+    const rememberSlowReadState = (): void => {
+      if (!sessionFileState) {
+        return;
+      }
+      if (
+        !this.afterTurnReconcileFullReadStates.has(fullReadKey)
+        && this.afterTurnReconcileFullReadStates.size
+          >= TranscriptReconciler.AFTER_TURN_RECONCILE_KEY_CAP
+      ) {
+        const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
+        if (typeof oldest === "string") {
+          this.afterTurnReconcileFullReadStates.delete(oldest);
+        }
+      }
+      this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
+    };
+    const slowPathStartedAt = Date.now();
+
+    if (isMissingFileError(sessionFileStatError)) {
+      if (!checkpoint) {
+        await this.seedPlaceholderBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+        );
+      } else {
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+        );
+      }
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: true,
+      };
+    }
+
+    // Distinguish empty-file from read/parse error: stat the file and
+    // only treat it as "actually empty" when size is 0. A non-zero file
+    // returning empty `historicalMessages` indicates the parser hit an
+    // error (and `readLeafPathMessages` swallows those into `[]`); in
+    // that case we must NOT mark the bootstrap checkpoint as fully
+    // processed, otherwise future afterTurns will skip reconciliation
+    // and we lose messages.
+    const historicalMessages = await readLeafPathMessages(params.sessionFile);
+    if (reason === "path-mismatch") {
+      const ambiguousRollover =
+        await this.rolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
+          phase: "afterTurn",
+          sessionId: params.sessionId,
+          sessionKey: params.sessionKey,
+          sessionFile: params.sessionFile,
+        });
+      if (ambiguousRollover) {
+        const activeBootstrapState =
+          await this.host.summaryStore.getConversationBootstrapState(
+            ambiguousRollover.conversationId,
+          );
+        const hasFrontierAnchor =
+          await this.rolloverDetector.transcriptContainsCurrentConversationTailAnchor({
+            conversationId: ambiguousRollover.conversationId,
+            historicalMessages,
+            checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
+          });
+        if (!hasFrontierAnchor) {
+          // Tier-2 resolution: archive the frozen conversation and
+          // create the replacement now. This turn's persistence is
+          // skipped (unsafe-to-advance), and the next turn reconciles
+          // the full transcript into the fresh conversation.
+          const rotatedForFreshTranscript =
+            await this.rolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
+              phase: "afterTurn",
+              sessionId: params.sessionId,
+              rollover: ambiguousRollover,
+              candidateMessages: historicalMessages,
+              createReplacement: true,
+            });
+          if (rotatedForFreshTranscript) {
+            return {
+              importedMessages: 0,
+              blockedByImportCap: false,
+              blockedReason: "ambiguous-rollover-rotated-fresh-transcript",
+              hasOverlap: false,
+            };
+          }
+          this.rolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
+            phase: "afterTurn",
+            rollover: ambiguousRollover,
+            sessionId: params.sessionId,
+            sessionFile: params.sessionFile,
+          });
+          return {
+            importedMessages: 0,
+            blockedByImportCap: false,
+            blockedReason: "ambiguous-session-key-runtime-rollover",
+            hasOverlap: false,
+          };
+        }
+      }
+    }
+    if (historicalMessages.length === 0) {
+      if (!sessionFileState) {
+        // #649 added this permissive stat-fail fallback expecting the
+        // afterTurn-tail `refreshAfterTurnBootstrapState` hook to refresh
+        // the checkpoint. That hook delegates to refreshBootstrapState,
+        // which itself calls `stat(sessionFile)` and throws on failure;
+        // the hook's catch then logs a warn and leaves
+        // conversation_bootstrap_state NULL. Subsequent turns re-enter
+        // the slow path with reason="checkpoint-missing" (excluded from
+        // allowNoAnchorImport) and the conversation gets stuck in a
+        // transparent-passthrough state where compaction never runs.
+        //
+        // Seed a placeholder bootstrap_state row ONLY when no checkpoint
+        // already exists. If a valid checkpoint is present (with a
+        // non-zero offset), a transient stat/read failure must NOT reset
+        // it to zero — that would cause the next successful read to
+        // replay every message from offset=0, duplicating rows in the
+        // messages table (identity_hash is not a uniqueness guard).
+        if (!checkpoint) {
+          await this.seedPlaceholderBootstrapState({
+            conversationId: conversation.conversationId,
+            sessionFile: params.sessionFile,
+          });
+          this.host.deps.log.warn(
+            `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+          );
+        } else {
+          // Checkpoint exists with a valid offset — a transient stat/read
+          // failure must NOT overwrite it. Leave the existing checkpoint
+          // intact so the next successful read resumes from the right offset.
+          this.host.deps.log.warn(
+            `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) instead of reseeding conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+          );
+        }
+        return {
+          importedMessages: 0,
+          blockedByImportCap: false,
+          hasOverlap: true,
+        };
+      }
+      if (sessionFileState.size === 0) {
+        // File is genuinely empty — refresh the checkpoint so the next
+        // afterTurn takes the incremental path.
+        await this.refreshBootstrapState({
+          conversationId: conversation.conversationId,
+          sessionFile: params.sessionFile,
+        });
+        rememberSlowReadState();
+      } else {
+        this.host.deps.log.warn(
+          `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+        );
+      }
+      // An empty transcript cannot carry the turn — let the runtime
+      // batch persist it (transcriptCovered stays false).
+      return {
+        importedMessages: 0,
+        blockedByImportCap: false,
+        hasOverlap: sessionFileState.size === 0,
+      };
+    }
+    // #837: a conversation with bootstrapped_at SET but no bootstrap_state
+    // row reaches reason="checkpoint-missing" with a non-anchoring frontier
+    // (e.g. a single injected metadata preamble). Without a no-anchor import
+    // it imports 0 messages and never persists a checkpoint, so afterTurn
+    // loops the "did not cover the transcript frontier" warning forever and
+    // compaction never runs. The rotate lane already recovers via
+    // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
+    // lane, but ONLY for the observed injected-metadata frontier. A real
+    // historical DB tail with a divergent rewritten transcript must still
+    // freeze per #649's no-proof-no-advance guard, so do not treat
+    // bootstrapped_at alone as lineage proof. The downstream no-anchor
+    // import path is itself guarded (replay-overlap detection, import cap,
+    // delivery-only block).
+    let checkpointMissingMetadataFrontier = false;
+    if (
+      reason === "checkpoint-missing" &&
+      conversation.sessionId === params.sessionId &&
+      conversation.bootstrappedAt !== null
+    ) {
+      const [existingMessageCount, latestPersistedMessage] = await Promise.all([
+        this.host.conversationStore.getMessageCount(conversation.conversationId),
+        this.host.conversationStore.getLastMessage(conversation.conversationId),
+      ]);
+      checkpointMissingMetadataFrontier =
+        existingMessageCount === 1 &&
+        latestPersistedMessage !== null &&
+        isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
+    }
+    const recoverCheckpointMissingNoAnchor =
+      reason === "checkpoint-missing" &&
+      (params.allowNoAnchorImportOnCheckpointMissing === true ||
+        checkpointMissingMetadataFrontier);
+    // A transcript whose session header id differs from the checkpoint's
+    // is a *declared* epoch change (rewrite/rotation) — no heuristics
+    // needed, so a same-path full rewrite may import as a new epoch
+    // instead of freezing on "no anchor". The no-anchor path's replay
+    // guards and import caps still apply as sanity bounds.
+    const transcriptHeader = await readTranscriptHeader(params.sessionFile);
+    const declaredEpochRollover =
+      resolveEpochRoute({
+        checkpointHeaderId: checkpoint?.sessionHeaderId,
+        transcriptHeaderId: transcriptHeader.sessionHeaderId,
+      }) === "declared-rollover";
+    if (declaredEpochRollover) {
+      this.host.deps.log.warn(
+        `[lcm] afterTurn: transcript session header changed (${checkpoint?.sessionHeaderId} -> ${transcriptHeader.sessionHeaderId}); treating as declared epoch rollover conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
+      );
+    }
+    const reconcile = await this.reconcileSessionTail({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      conversationId: conversation.conversationId,
+      historicalMessages,
+      lastProcessedEntryId: declaredEpochRollover
+        ? null
+        : checkpoint?.lastProcessedEntryId ?? null,
+      skipContentAnchorScan: reason === "same-path-shrink",
+      allowNoAnchorImport:
+        reason === "path-mismatch" ||
+        reason === "same-path-shrink" ||
+        declaredEpochRollover ||
+        recoverCheckpointMissingNoAnchor,
+      noAnchorImportReason: recoverCheckpointMissingNoAnchor
+        ? params.allowNoAnchorImportOnCheckpointMissing === true
+          ? "rotate-checkpoint-missing"
+          : "checkpoint-missing-recovery"
+        : declaredEpochRollover && reason === "append-only-ineligible"
+          ? "declared-epoch-rollover"
+          : reason,
+    });
+    if (reconcile.blockedByImportCap) {
+      // Capped passes import a bounded chunk of anchored backlog; report
+      // the partial progress while leaving the checkpoint un-advanced so
+      // the next pass continues the drain.
+      return {
+        importedMessages: reconcile.importedMessages,
+        blockedByImportCap: true,
+        hasOverlap: reconcile.hasOverlap,
+      };
+    }
+    if (reconcile.importedMessages > 0) {
+      this.host.recordRecentBootstrapImport(
+        conversation.conversationId,
+        reconcile.importedMessages,
+        "reconciled missing session messages",
+      );
+    }
+    if (!reconcile.hasOverlap && reconcile.importedMessages === 0) {
+      this.host.deps.log.warn(
+        `[lcm] afterTurn: transcript reconcile found no anchor and imported 0 messages; skipping checkpoint refresh conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length}`,
+      );
+      return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
+    }
+    // Refresh only after the slow-path read either found an overlap or
+    // imported the bounded no-anchor epoch. A no-overlap/no-import result
+    // leaves the checkpoint stale on purpose so future turns can retry.
+    await this.refreshBootstrapState({
+      conversationId: conversation.conversationId,
+      sessionFile: params.sessionFile,
+    });
+    rememberSlowReadState();
+    this.host.deps.log.warn(
+      `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
+    );
+    return {
+      importedMessages: reconcile.importedMessages,
+      blockedByImportCap: false,
+      hasOverlap: reconcile.hasOverlap,
+      transcriptCovered: true,
+    };
+  }
+
   async reconcileTranscriptTailForAfterTurnInSessionQueue(params: {
     sessionId: string;
     sessionKey?: string;
@@ -1401,553 +2041,67 @@ export class TranscriptReconciler {
         createReplacement: false,
       });
     });
-        const conversation = await this.host.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          if (params.isHeartbeat) {
-            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
-          }
-          // No persisted conversation exists yet. Prefer the transcript over
-          // the runtime delta so foreground prompts that are omitted from
-          // afterTurn's messages array are not lost.
-          let sessionFileState: { size: number } | undefined;
-          try {
-            const sessionFileStats = await stat(params.sessionFile);
-            sessionFileState = { size: sessionFileStats.size };
-          } catch {
-            // Missing files are common for brand-new live sessions; allow the
-            // runtime batch to seed the conversation in that case.
-          }
-          const historicalMessages = await readLeafPathMessages(params.sessionFile);
-          if (historicalMessages.length === 0) {
-            if ((sessionFileState?.size ?? 0) > 0) {
-              this.host.deps.log.warn(
-                `[lcm] afterTurn: initial transcript read returned no messages from non-empty file; skipping live afterTurn persistence to avoid anchoring past unreadable history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile}`,
-              );
-              return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
-            }
-            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
-          }
-          if (batchLooksLikeHeartbeatAckTurn(historicalMessages)) {
-            // Not covered: the runtime batch path owns conversation creation
-            // and heartbeat-ack pruning for brand-new sessions.
-            return { importedMessages: 0, blockedByImportCap: false, hasOverlap: true };
-          }
-          const bootstrapMessages = trimBootstrapMessagesToBudget(
-            historicalMessages,
-            resolveBootstrapMaxTokens(this.host.config),
-          );
-          if (bootstrapMessages.length === 0) {
-            this.host.deps.log.warn(
-              `[lcm] afterTurn: initial transcript import exceeded bootstrap budget; skipping live afterTurn persistence to avoid anchoring past unreconciled history session=${params.sessionId}${params.sessionKey?.trim() ? ` sessionKey=${params.sessionKey.trim()}` : ""} sessionFile=${params.sessionFile} sourceMessages=${historicalMessages.length}`,
-            );
-            return { importedMessages: 0, blockedByImportCap: true, hasOverlap: false };
-          }
-          let importedMessages = 0;
-          for (const message of bootstrapMessages) {
-            const result = await this.host.ingestSingle({
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              message,
-              skipReplayTimestampFloodGuard: true,
-            });
-            if (result.ingested) {
-              importedMessages += 1;
-            }
-          }
-          if (importedMessages > 0) {
-            const activeConversation = await this.host.conversationStore.getConversationForSession({
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-            });
-            if (activeConversation) {
-              this.host.recordRecentBootstrapImport(
-                activeConversation.conversationId,
-                importedMessages,
-                "imported initial afterTurn transcript",
-              );
-              await this.refreshBootstrapState({
-                conversationId: activeConversation.conversationId,
-                sessionFile: params.sessionFile,
-              });
-            }
-          }
-          return {
-            importedMessages,
-            blockedByImportCap: bootstrapMessages.length < historicalMessages.length,
-            hasOverlap: true,
-            transcriptCovered: true,
-          };
-        }
+    const conversation = await this.host.conversationStore.getConversationForSession({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+    });
+    if (!conversation) {
+      return this.importInitialAfterTurnTranscript({
+        sessionId: params.sessionId,
+        sessionKey: params.sessionKey,
+        sessionFile: params.sessionFile,
+        isHeartbeat: params.isHeartbeat,
+      });
+    }
 
-        // OpenClaw can submit the foreground prompt outside the mutable
-        // messages array passed to afterTurn. The transcript has the complete
-        // turn by this point, so reconcile it before accepting assistant-only
-        // deltas from the runtime snapshot.
-        const checkpoint = await this.host.summaryStore.getConversationBootstrapState(
-          conversation.conversationId,
-        );
-        let sessionFileState: { size: number; mtimeMs: number } | undefined;
-        let sessionFileStatError: unknown;
-        try {
-          const sessionFileStats = await stat(params.sessionFile);
-          sessionFileState = {
-            size: sessionFileStats.size,
-            mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
-          };
-        } catch (error) {
-          sessionFileStatError = error;
-          // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
-        }
-        const transcriptEpochShrank = checkpointIsPastTranscriptEof(
-          checkpoint,
-          sessionFileState?.size ?? Number.POSITIVE_INFINITY,
-        );
-        if (
-          checkpoint &&
-          checkpoint.sessionFilePath === params.sessionFile &&
-          checkpoint.lastProcessedOffset >= 0 &&
-          !transcriptEpochShrank
-        ) {
-          const appended = await readAppendedLeafPathMessages({
-            sessionFile: params.sessionFile,
-            offset: checkpoint.lastProcessedOffset,
-          });
-          if (appended.canUseAppendOnly) {
-            const placeholderCheckpoint =
-              checkpoint.lastSeenSize === 0 &&
-              checkpoint.lastSeenMtimeMs === 0 &&
-              checkpoint.lastProcessedOffset === 0 &&
-              checkpoint.lastProcessedEntryHash === null;
-            if (params.isHeartbeat) {
-              if (!placeholderCheckpoint) {
-                await this.refreshBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFile: params.sessionFile,
-                });
-                this.host.deps.log.debug(
-                  `[lcm] afterTurn: skipped heartbeat transcript append-only delta and refreshed checkpoint conversation=${conversation.conversationId} sessionFile=${params.sessionFile} appendedMessages=${appended.messages.length}`,
-                );
-              }
-              // Heartbeat turns are never persisted; the append-only delta is
-              // intentionally skipped, so the transcript counts as covered.
-              return {
-                importedMessages: 0,
-                blockedByImportCap: false,
-                hasOverlap: true,
-                transcriptCovered: true,
-              };
-            }
-            if (placeholderCheckpoint && appended.messages.length > 0) {
-              const reconcile = await this.reconcileSessionTail({
-                sessionId: params.sessionId,
-                sessionKey: params.sessionKey,
-                conversationId: conversation.conversationId,
-                historicalMessages: appended.messages,
-                noAnchorImportReason: "placeholder-checkpoint-recovery",
-              });
-              if (reconcile.importedMessages > 0) {
-                this.host.recordRecentBootstrapImport(
-                  conversation.conversationId,
-                  reconcile.importedMessages,
-                  "reconciled missing session messages",
-                );
-                await this.refreshBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFile: params.sessionFile,
-                });
-              }
-              return {
-                ...reconcile,
-                transcriptCovered: reconcile.hasOverlap || reconcile.importedMessages > 0,
-              };
-            }
+    // OpenClaw can submit the foreground prompt outside the mutable
+    // messages array passed to afterTurn. The transcript has the complete
+    // turn by this point, so reconcile it before accepting assistant-only
+    // deltas from the runtime snapshot.
+    const checkpoint = await this.host.summaryStore.getConversationBootstrapState(
+      conversation.conversationId,
+    );
+    let sessionFileState: { size: number; mtimeMs: number } | undefined;
+    let sessionFileStatError: unknown;
+    try {
+      const sessionFileStats = await stat(params.sessionFile);
+      sessionFileState = {
+        size: sessionFileStats.size,
+        mtimeMs: Math.trunc(sessionFileStats.mtimeMs),
+      };
+    } catch (error) {
+      sessionFileStatError = error;
+      // Leave undefined: without stat proof, do not use append-only guards or slow-read caps.
+    }
+    const transcriptEpochShrank = checkpointIsPastTranscriptEof(
+      checkpoint,
+      sessionFileState?.size ?? Number.POSITIVE_INFINITY,
+    );
+    const appendOnlyResult = await this.tryAppendOnlyReconcile({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      sessionFile: params.sessionFile,
+      isHeartbeat: params.isHeartbeat,
+      conversation,
+      checkpoint,
+      transcriptEpochShrank,
+    });
+    if (appendOnlyResult) {
+      return appendOnlyResult;
+    }
 
-            const appendOnlySessionContext = this.host.formatSessionLogContext({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-            });
-            const replayFiltered = await this.filterBootstrapReplayMessages({
-              messages: appended.messages,
-              sessionContext: appendOnlySessionContext,
-              source: "afterTurn transcript reconcile append-only",
-              sessionFile: params.sessionFile,
-            });
-            const replayFilteredMessages = replayFiltered.messages;
-            const appendOnlyOverlapsPersisted = await this.appendOnlyMessagesOverlapPersistedTranscript({
-              conversationId: conversation.conversationId,
-              messages: replayFilteredMessages,
-              unfilteredMessages: appended.messages,
-              sessionContext: appendOnlySessionContext,
-              source: "afterTurn transcript reconcile append-only",
-            });
-            if (!appendOnlyOverlapsPersisted) {
-              let importedMessages = 0;
-              for (const [index, message] of replayFilteredMessages.entries()) {
-                const result = await this.host.ingestSingle({
-                  sessionId: params.sessionId,
-                  sessionKey: params.sessionKey,
-                  message,
-                  skipReplayTimestampFloodGuard:
-                    index < replayFiltered.replayGuardExemptPrefixLength,
-                });
-                if (result.ingested) {
-                  importedMessages += 1;
-                }
-              }
-              if (importedMessages > 0) {
-                this.host.recordRecentBootstrapImport(
-                  conversation.conversationId,
-                  importedMessages,
-                  "reconciled missing session messages",
-                );
-                await this.refreshBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFile: params.sessionFile,
-                });
-              }
-              return {
-                importedMessages,
-                blockedByImportCap: false,
-                hasOverlap: true,
-                transcriptCovered: true,
-              };
-            }
-          }
-        }
-
-        // Slow path: checkpoint missing, path mismatched, or non-append-only.
-        // Cap full re-reads only for unchanged file states. If the transcript
-        // changed since the last full read, reconcile again; if it did not,
-        // skip without advancing the checkpoint so stale state can be retried
-        // after a later file change, process restart, or cap eviction.
-        const fullReadKey = `${queueKey}\u0000${params.sessionFile}`;
-        const reason = !checkpoint
-          ? "checkpoint-missing"
-          : checkpoint.sessionFilePath !== params.sessionFile
-            ? "path-mismatch"
-            : transcriptEpochShrank
-              ? "same-path-shrink"
-              : "append-only-ineligible";
-        if (reason === "same-path-shrink") {
-          this.afterTurnReconcileFullReadStates.delete(fullReadKey);
-        }
-        const rememberedFileState = this.afterTurnReconcileFullReadStates.get(fullReadKey);
-        if (
-          rememberedFileState
-          && sessionFileState
-          && rememberedFileState.size === sessionFileState.size
-          && rememberedFileState.mtimeMs === sessionFileState.mtimeMs
-        ) {
-          this.host.deps.log.debug(
-            `[lcm] afterTurn: transcript reconcile slow path skipped (file state already read this process) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-          );
-          // The memo is only populated after a successful covered full read,
-          // and the file has not changed since — still covered.
-          return {
-            importedMessages: 0,
-            blockedByImportCap: false,
-            hasOverlap: true,
-            transcriptCovered: true,
-          };
-        }
-
-        const rememberSlowReadState = (): void => {
-          if (!sessionFileState) {
-            return;
-          }
-          if (
-            !this.afterTurnReconcileFullReadStates.has(fullReadKey)
-            && this.afterTurnReconcileFullReadStates.size
-              >= TranscriptReconciler.AFTER_TURN_RECONCILE_KEY_CAP
-          ) {
-            const oldest = this.afterTurnReconcileFullReadStates.keys().next().value;
-            if (typeof oldest === "string") {
-              this.afterTurnReconcileFullReadStates.delete(oldest);
-            }
-          }
-          this.afterTurnReconcileFullReadStates.set(fullReadKey, sessionFileState);
-        };
-        const slowPathStartedAt = Date.now();
-
-        if (isMissingFileError(sessionFileStatError)) {
-          if (!checkpoint) {
-            try {
-              await this.host.summaryStore.upsertConversationBootstrapState({
-                conversationId: conversation.conversationId,
-                sessionFilePath: params.sessionFile,
-                lastSeenSize: 0,
-                lastSeenMtimeMs: 0,
-                lastProcessedOffset: 0,
-                lastProcessedEntryHash: null,
-              });
-            } catch (seedError) {
-              this.host.deps.log.warn(
-                `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
-              );
-            }
-            this.host.deps.log.warn(
-              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-            );
-          } else {
-            this.host.deps.log.warn(
-              `[lcm] afterTurn: session file missing; skipping transcript reconcile full reread; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-            );
-          }
-          return {
-            importedMessages: 0,
-            blockedByImportCap: false,
-            hasOverlap: true,
-          };
-        }
-
-        // Distinguish empty-file from read/parse error: stat the file and
-        // only treat it as "actually empty" when size is 0. A non-zero file
-        // returning empty `historicalMessages` indicates the parser hit an
-        // error (and `readLeafPathMessages` swallows those into `[]`); in
-        // that case we must NOT mark the bootstrap checkpoint as fully
-        // processed, otherwise future afterTurns will skip reconciliation
-        // and we lose messages.
-        const historicalMessages = await readLeafPathMessages(params.sessionFile);
-        if (reason === "path-mismatch") {
-          const ambiguousRollover =
-            await this.rolloverDetector.findAmbiguousSessionKeyRuntimeRollover({
-              phase: "afterTurn",
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              sessionFile: params.sessionFile,
-            });
-          if (ambiguousRollover) {
-            const activeBootstrapState =
-              await this.host.summaryStore.getConversationBootstrapState(
-                ambiguousRollover.conversationId,
-              );
-            const hasFrontierAnchor =
-              await this.rolloverDetector.transcriptContainsCurrentConversationTailAnchor({
-                conversationId: ambiguousRollover.conversationId,
-                historicalMessages,
-                checkpointEntryHash: activeBootstrapState?.lastProcessedEntryHash,
-              });
-            if (!hasFrontierAnchor) {
-              // Tier-2 resolution: archive the frozen conversation and
-              // create the replacement now. This turn's persistence is
-              // skipped (unsafe-to-advance), and the next turn reconciles
-              // the full transcript into the fresh conversation.
-              const rotatedForFreshTranscript =
-                await this.rolloverDetector.rotateAmbiguousRolloverForProvablyFreshTranscript({
-                  phase: "afterTurn",
-                  sessionId: params.sessionId,
-                  rollover: ambiguousRollover,
-                  candidateMessages: historicalMessages,
-                  createReplacement: true,
-                });
-              if (rotatedForFreshTranscript) {
-                return {
-                  importedMessages: 0,
-                  blockedByImportCap: false,
-                  blockedReason: "ambiguous-rollover-rotated-fresh-transcript",
-                  hasOverlap: false,
-                };
-              }
-              this.rolloverDetector.logAmbiguousSessionKeyRuntimeRollover({
-                phase: "afterTurn",
-                rollover: ambiguousRollover,
-                sessionId: params.sessionId,
-                sessionFile: params.sessionFile,
-              });
-              return {
-                importedMessages: 0,
-                blockedByImportCap: false,
-                blockedReason: "ambiguous-session-key-runtime-rollover",
-                hasOverlap: false,
-              };
-            }
-          }
-        }
-        if (historicalMessages.length === 0) {
-          if (!sessionFileState) {
-            // #649 added this permissive stat-fail fallback expecting the
-            // afterTurn-tail `refreshAfterTurnBootstrapState` hook to refresh
-            // the checkpoint. That hook delegates to refreshBootstrapState,
-            // which itself calls `stat(sessionFile)` and throws on failure;
-            // the hook's catch then logs a warn and leaves
-            // conversation_bootstrap_state NULL. Subsequent turns re-enter
-            // the slow path with reason="checkpoint-missing" (excluded from
-            // allowNoAnchorImport) and the conversation gets stuck in a
-            // transparent-passthrough state where compaction never runs.
-            //
-            // Seed a placeholder bootstrap_state row ONLY when no checkpoint
-            // already exists. If a valid checkpoint is present (with a
-            // non-zero offset), a transient stat/read failure must NOT reset
-            // it to zero — that would cause the next successful read to
-            // replay every message from offset=0, duplicating rows in the
-            // messages table (identity_hash is not a uniqueness guard).
-            if (!checkpoint) {
-              try {
-                await this.host.summaryStore.upsertConversationBootstrapState({
-                  conversationId: conversation.conversationId,
-                  sessionFilePath: params.sessionFile,
-                  lastSeenSize: 0,
-                  lastSeenMtimeMs: 0,
-                  lastProcessedOffset: 0,
-                  lastProcessedEntryHash: null,
-                });
-              } catch (seedError) {
-                this.host.deps.log.warn(
-                  `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
-                );
-              }
-              this.host.deps.log.warn(
-                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-              );
-            } else {
-              // Checkpoint exists with a valid offset — a transient stat/read
-              // failure must NOT overwrite it. Leave the existing checkpoint
-              // intact so the next successful read resumes from the right offset.
-              this.host.deps.log.warn(
-                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) instead of reseeding conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-              );
-            }
-            return {
-              importedMessages: 0,
-              blockedByImportCap: false,
-              hasOverlap: true,
-            };
-          }
-          if (sessionFileState.size === 0) {
-            // File is genuinely empty — refresh the checkpoint so the next
-            // afterTurn takes the incremental path.
-            await this.refreshBootstrapState({
-              conversationId: conversation.conversationId,
-              sessionFile: params.sessionFile,
-            });
-            rememberSlowReadState();
-          } else {
-            this.host.deps.log.warn(
-              `[lcm] afterTurn: transcript reconcile slow path read empty messages from non-empty file (${sessionFileState?.size ?? "?"} bytes) — skipping checkpoint refresh to avoid dropping messages on parser failure conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-            );
-          }
-          // An empty transcript cannot carry the turn — let the runtime
-          // batch persist it (transcriptCovered stays false).
-          return {
-            importedMessages: 0,
-            blockedByImportCap: false,
-            hasOverlap: sessionFileState.size === 0,
-          };
-        }
-        // #837: a conversation with bootstrapped_at SET but no bootstrap_state
-        // row reaches reason="checkpoint-missing" with a non-anchoring frontier
-        // (e.g. a single injected metadata preamble). Without a no-anchor import
-        // it imports 0 messages and never persists a checkpoint, so afterTurn
-        // loops the "did not cover the transcript frontier" warning forever and
-        // compaction never runs. The rotate lane already recovers via
-        // allowNoAnchorImportOnCheckpointMissing; mirror that on the afterTurn
-        // lane, but ONLY for the observed injected-metadata frontier. A real
-        // historical DB tail with a divergent rewritten transcript must still
-        // freeze per #649's no-proof-no-advance guard, so do not treat
-        // bootstrapped_at alone as lineage proof. The downstream no-anchor
-        // import path is itself guarded (replay-overlap detection, import cap,
-        // delivery-only block).
-        let checkpointMissingMetadataFrontier = false;
-        if (
-          reason === "checkpoint-missing" &&
-          conversation.sessionId === params.sessionId &&
-          conversation.bootstrappedAt !== null
-        ) {
-          const [existingMessageCount, latestPersistedMessage] = await Promise.all([
-            this.host.conversationStore.getMessageCount(conversation.conversationId),
-            this.host.conversationStore.getLastMessage(conversation.conversationId),
-          ]);
-          checkpointMissingMetadataFrontier =
-            existingMessageCount === 1 &&
-            latestPersistedMessage !== null &&
-            isLikelyInjectedMetadataPreambleRecord(latestPersistedMessage);
-        }
-        const recoverCheckpointMissingNoAnchor =
-          reason === "checkpoint-missing" &&
-          (params.allowNoAnchorImportOnCheckpointMissing === true ||
-            checkpointMissingMetadataFrontier);
-        // A transcript whose session header id differs from the checkpoint's
-        // is a *declared* epoch change (rewrite/rotation) — no heuristics
-        // needed, so a same-path full rewrite may import as a new epoch
-        // instead of freezing on "no anchor". The no-anchor path's replay
-        // guards and import caps still apply as sanity bounds.
-        const transcriptHeader = await readTranscriptHeader(params.sessionFile);
-        const declaredEpochRollover =
-          resolveEpochRoute({
-            checkpointHeaderId: checkpoint?.sessionHeaderId,
-            transcriptHeaderId: transcriptHeader.sessionHeaderId,
-          }) === "declared-rollover";
-        if (declaredEpochRollover) {
-          this.host.deps.log.warn(
-            `[lcm] afterTurn: transcript session header changed (${checkpoint?.sessionHeaderId} -> ${transcriptHeader.sessionHeaderId}); treating as declared epoch rollover conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile}`,
-          );
-        }
-        const reconcile = await this.reconcileSessionTail({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-          conversationId: conversation.conversationId,
-          historicalMessages,
-          lastProcessedEntryId: declaredEpochRollover
-            ? null
-            : checkpoint?.lastProcessedEntryId ?? null,
-          skipContentAnchorScan: reason === "same-path-shrink",
-          allowNoAnchorImport:
-            reason === "path-mismatch" ||
-            reason === "same-path-shrink" ||
-            declaredEpochRollover ||
-            recoverCheckpointMissingNoAnchor,
-          noAnchorImportReason: recoverCheckpointMissingNoAnchor
-            ? params.allowNoAnchorImportOnCheckpointMissing === true
-              ? "rotate-checkpoint-missing"
-              : "checkpoint-missing-recovery"
-            : declaredEpochRollover && reason === "append-only-ineligible"
-              ? "declared-epoch-rollover"
-              : reason,
-        });
-        if (reconcile.blockedByImportCap) {
-          // Capped passes import a bounded chunk of anchored backlog; report
-          // the partial progress while leaving the checkpoint un-advanced so
-          // the next pass continues the drain.
-          return {
-            importedMessages: reconcile.importedMessages,
-            blockedByImportCap: true,
-            hasOverlap: reconcile.hasOverlap,
-          };
-        }
-        if (reconcile.importedMessages > 0) {
-          this.host.recordRecentBootstrapImport(
-            conversation.conversationId,
-            reconcile.importedMessages,
-            "reconciled missing session messages",
-          );
-        }
-        if (!reconcile.hasOverlap && reconcile.importedMessages === 0) {
-          this.host.deps.log.warn(
-            `[lcm] afterTurn: transcript reconcile found no anchor and imported 0 messages; skipping checkpoint refresh conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length}`,
-          );
-          return { importedMessages: 0, blockedByImportCap: false, hasOverlap: false };
-        }
-        // Refresh only after the slow-path read either found an overlap or
-        // imported the bounded no-anchor epoch. A no-overlap/no-import result
-        // leaves the checkpoint stale on purpose so future turns can retry.
-        await this.refreshBootstrapState({
-          conversationId: conversation.conversationId,
-          sessionFile: params.sessionFile,
-        });
-        rememberSlowReadState();
-        this.host.deps.log.warn(
-          `[lcm] afterTurn: transcript reconcile slow path (full re-read) conversation=${conversation.conversationId} reason=${reason} sessionFile=${params.sessionFile} historicalMessages=${historicalMessages.length} importedMessages=${reconcile.importedMessages} duration=${formatDurationMs(Date.now() - slowPathStartedAt)}`,
-        );
-        return {
-          importedMessages: reconcile.importedMessages,
-          blockedByImportCap: false,
-          hasOverlap: reconcile.hasOverlap,
-          transcriptCovered: true,
-        };
+    return this.fullReadAfterTurnReconcile({
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      sessionFile: params.sessionFile,
+      allowNoAnchorImportOnCheckpointMissing: params.allowNoAnchorImportOnCheckpointMissing,
+      queueKey,
+      conversation,
+      checkpoint,
+      sessionFileState,
+      sessionFileStatError,
+      transcriptEpochShrank,
+    });
   }
 
   filterSyntheticHeartbeatTranscriptMessages(params: {
